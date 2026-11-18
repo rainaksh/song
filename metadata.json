@@ -1,0 +1,6 @@
+{
+  "name": "Swara — Ad-Free Music Player",
+  "description": "Non-stop, ad-free music streaming with background playback and lock-screen media controls.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

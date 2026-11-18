@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Swara — Ad-Free Music Player</title>
+    <meta name="description" content="Non-stop, ad-free music streaming with background playback and lock-screen media controls." />
+    <meta property="og:title" content="Swara — Ad-Free Music Player" />
+    <meta property="og:description" content="Non-stop, ad-free music streaming with background playback and lock-screen media controls." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="theme-color" content="#0B0C0E" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Outfit:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body class="bg-[#0B0C0E] text-[#F3F4F6] antialiased selection:bg-emerald-500/30 selection:text-emerald-200">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+    <script>
+      (function () {
+        if (typeof window === 'undefined') return;
+        var hasRawEntry = !!document.querySelector('script[src="/src/main.tsx"]');
+        if (!hasRawEntry || window.__SWARA_MOUNTED__ || window.location.pathname.indexOf('/docs') !== -1) return;
+        function goDocs() {
+          var p = window.location.pathname.replace(/\/index\.html$/, '/');
+          var base = p.endsWith('/') ? p : p + '/';
+          window.location.replace(base + 'docs/' + window.location.search + window.location.hash);
+        }
+        if (window.location.hostname.endsWith('github.io')) {
+          goDocs();
+          return;
+        }
+        window.addEventListener('load', function () {
+          setTimeout(function () {
+            if (!window.__SWARA_MOUNTED__) {
+              fetch('./docs/index.html', { method: 'HEAD' }).then(function (r) {
+                if (r.ok) goDocs();
+              }).catch(function () {});
+            }
+          }, 800);
+        });
+      })();
+    </script>
+  </body>
+</html>
+
