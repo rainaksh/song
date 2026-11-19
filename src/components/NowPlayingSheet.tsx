@@ -1,6 +1,7 @@
-import { useEffect, useRef, type MutableRefObject, type RefObject } from 'react';
+import { useEffect, useRef, useState, type MutableRefObject, type RefObject } from 'react';
 import {
   ChevronDown,
+  FileText,
   Heart,
   ListMusic,
   Loader2,
@@ -23,6 +24,7 @@ import {
 import type { AudioQuality, RepeatMode, Track } from '../types/music';
 import { formatDuration } from '../utils/format';
 import { ArtworkImage } from './ArtworkImage';
+import { LyricsPanel } from './LyricsPanel';
 
 export interface YouTubePlayerControls {
   play: () => void;
@@ -140,6 +142,8 @@ interface NowPlayingSheetProps {
   onToggleAutoplay?: () => void;
   onSelectPlaylistTrack?: (track: Track) => void;
   onRemovePlaylistTrack?: (index: number) => void;
+  audioOnlyVideo?: boolean;
+  onShowVideoStage?: () => void;
 }
 
 const QUALITIES: AudioQuality[] = ['320kbps', '160kbps', '96kbps'];
@@ -191,11 +195,16 @@ export function NowPlayingSheet({
   onToggleAutoplay,
   onSelectPlaylistTrack,
   onRemovePlaylistTrack,
+  audioOnlyVideo = false,
+  onShowVideoStage,
 }: NowPlayingSheetProps) {
   const cinemaStageRef = useRef<HTMLDivElement | null>(null);
   const ytContainerRef = useRef<HTMLDivElement | null>(null);
   const ytPlayerRef = useRef<YTPlayerInstance | null>(null);
   const loadedYtIdRef = useRef<string>('');
+  const [showDesktopLyrics, setShowDesktopLyrics] = useState(true);
+  const [mobileAudioView, setMobileAudioView] = useState<'media' | 'lyrics'>('media');
+  const [videoSidebarTab, setVideoSidebarTab] = useState<'playlist' | 'lyrics'>('playlist');
 
   const callbacksRef = useRef({
     onVideoEnded,
@@ -349,6 +358,7 @@ export function NowPlayingSheet({
 
   if (!track) return null;
 
+  const showVideoStage = isVideo && !audioOnlyVideo;
   const showCinemaVisual = !isVideo && visualMode;
   const effectiveDuration = duration || track.duration || 0;
   const progressPercent =
@@ -409,7 +419,7 @@ export function NowPlayingSheet({
       {/* Top bar */}
       <header
         className={`relative z-10 flex items-center justify-between px-4 sm:px-8 py-4 w-full mx-auto ${
-          isVideo ? 'max-w-6xl' : 'max-w-4xl'
+          showVideoStage || showDesktopLyrics ? 'max-w-6xl' : 'max-w-4xl'
         }`}
       >
         <button
@@ -421,8 +431,8 @@ export function NowPlayingSheet({
           <ChevronDown size={24} />
         </button>
 
-        <span className="text-xs font-medium text-zinc-400 tracking-wide">
-          {isVideo
+        <span className="text-xs font-medium text-zinc-400 tracking-wide truncate px-2">
+          {showVideoStage
             ? isYoutube || isDmEmbed
               ? 'Full Video Theater · Continuous Playlist'
               : 'Video Stage · Screen-Off Background Ready'
@@ -431,31 +441,88 @@ export function NowPlayingSheet({
               : 'Audio Stage · Ad-Free'}
         </span>
 
-        <button
-          type="button"
-          onClick={onToggleFavorite}
-          className={`min-h-[44px] min-w-[44px] flex items-center justify-center rounded-xl transition-colors ${
-            isFavorite
-              ? 'text-emerald-400 hover:bg-white/[0.08]'
-              : 'text-zinc-400 hover:text-white hover:bg-white/[0.08]'
-          }`}
-          aria-label={isFavorite ? 'Remove from favorites' : 'Save to favorites'}
-        >
-          <Heart size={20} className={isFavorite ? 'fill-emerald-400' : ''} />
-        </button>
+        <div className="flex items-center gap-1 shrink-0">
+          {!showVideoStage && (
+            <button
+              type="button"
+              onClick={() => {
+                setShowDesktopLyrics((v) => !v);
+                setMobileAudioView((v) => (v === 'lyrics' ? 'media' : 'lyrics'));
+              }}
+              className={`hidden lg:inline-flex min-h-[44px] px-3 items-center gap-1.5 rounded-xl text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                showDesktopLyrics
+                  ? 'text-emerald-300 bg-emerald-500/15 hover:bg-emerald-500/20'
+                  : 'text-zinc-300 hover:text-white hover:bg-white/[0.08]'
+              }`}
+              aria-pressed={showDesktopLyrics}
+              aria-label={showDesktopLyrics ? 'Hide lyrics panel' : 'Show lyrics panel'}
+            >
+              <FileText size={16} />
+              <span>Lyrics</span>
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={onToggleFavorite}
+            className={`min-h-[44px] min-w-[44px] flex items-center justify-center rounded-xl transition-colors ${
+              isFavorite
+                ? 'text-emerald-400 hover:bg-white/[0.08]'
+                : 'text-zinc-400 hover:text-white hover:bg-white/[0.08]'
+            }`}
+            aria-label={isFavorite ? 'Remove from favorites' : 'Save to favorites'}
+          >
+            <Heart size={20} className={isFavorite ? 'fill-emerald-400' : ''} />
+          </button>
+        </div>
       </header>
 
       {/* Main focal media */}
       <div
         className={`relative z-10 flex-1 w-full mx-auto px-4 sm:px-8 pb-10 pt-2 ${
-          isVideo
-            ? 'max-w-6xl grid grid-cols-1 lg:grid-cols-[1fr_360px] gap-6 items-start'
-            : 'max-w-2xl flex flex-col items-center justify-center'
+          showVideoStage
+            ? 'max-w-6xl grid grid-cols-1 lg:grid-cols-[1fr_380px] gap-6 items-start'
+            : showDesktopLyrics
+              ? 'max-w-6xl grid grid-cols-1 lg:grid-cols-[1fr_420px] gap-8 items-start lg:items-center'
+              : 'max-w-2xl flex flex-col items-center justify-center'
         }`}
       >
         <div className="w-full flex flex-col items-center">
-          {isVideo ? (
-            <div className="w-full aspect-video rounded-2xl overflow-hidden bg-black border border-white/[0.1] shadow-2xl relative">
+          {/* Mobile segmented switch for Audio Cover vs Synced Lyrics */}
+          {!showVideoStage && (
+            <div className="lg:hidden mb-4 flex items-center gap-1 p-1 rounded-xl bg-white/[0.06] border border-white/[0.08]">
+              <button
+                type="button"
+                onClick={() => setMobileAudioView('media')}
+                className={`min-h-[38px] px-4 py-1.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                  mobileAudioView === 'media'
+                    ? 'bg-emerald-500 text-zinc-950 font-semibold'
+                    : 'text-zinc-300 hover:text-white'
+                }`}
+              >
+                {showCinemaVisual ? 'Cinema View' : 'Cover'}
+              </button>
+              <button
+                type="button"
+                onClick={() => setMobileAudioView('lyrics')}
+                className={`min-h-[38px] px-4 py-1.5 rounded-lg text-xs font-medium inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
+                  mobileAudioView === 'lyrics'
+                    ? 'bg-emerald-500 text-zinc-950 font-semibold'
+                    : 'text-zinc-300 hover:text-white'
+                }`}
+              >
+                <FileText size={13} />
+                <span>Lyrics</span>
+              </button>
+            </div>
+          )}
+          {isVideo && (
+            <div
+              className={
+                audioOnlyVideo
+                  ? 'fixed -left-[9999px] w-px h-px opacity-0 pointer-events-none overflow-hidden'
+                  : 'w-full aspect-video rounded-2xl overflow-hidden bg-black border border-white/[0.1] shadow-2xl relative'
+              }
+            >
               {isYoutube ? (
                 <div ref={ytContainerRef} className="w-full h-full bg-black" />
               ) : isDmEmbed ? (
@@ -513,89 +580,107 @@ export function NowPlayingSheet({
                 </>
               )}
             </div>
-          ) : showCinemaVisual ? (
-            <div className="w-full">
-              <div
-                ref={cinemaStageRef}
-                onClick={onTogglePlay}
-                className="w-full aspect-video rounded-2xl overflow-hidden bg-[#07080A] border border-white/[0.1] shadow-2xl relative cursor-pointer select-none"
-              >
-                {track.artwork.large && (
-                  <img
-                    src={track.artwork.large}
-                    alt=""
-                    referrerPolicy="no-referrer"
-                    className={`absolute inset-0 w-full h-full object-cover transition-transform duration-700 ${
-                      isPlaying ? 'scale-110 opacity-40' : 'scale-105 opacity-25'
-                    } blur-2xl`}
-                  />
-                )}
-                <div className="absolute inset-0 bg-gradient-to-t from-black/90 via-black/45 to-black/60" />
+          )}
 
-                <div className="relative z-10 h-full flex flex-col items-center justify-center p-5 text-center">
-                  <div
-                    className={`w-28 h-28 sm:w-36 sm:h-36 rounded-2xl overflow-hidden shadow-2xl border border-white/[0.14] transition-transform duration-500 ${
-                      isPlaying ? 'scale-100' : 'scale-95 opacity-90'
-                    }`}
-                  >
+          {(!isVideo || audioOnlyVideo) && (
+            <>
+              {mobileAudioView === 'lyrics' && (
+                <div className="w-full max-w-lg lg:hidden">
+                  <LyricsPanel
+                    track={track}
+                    currentTime={currentTime}
+                    onSeek={onSeek}
+                    className="h-[340px]"
+                  />
+                </div>
+              )}
+              <div className={mobileAudioView === 'lyrics' ? 'hidden lg:block w-full' : 'w-full'}>
+                {showCinemaVisual ? (
+                  <div className="w-full">
+                    <div
+                      ref={cinemaStageRef}
+                      onClick={onTogglePlay}
+                      className="w-full aspect-video rounded-2xl overflow-hidden bg-[#07080A] border border-white/[0.1] shadow-2xl relative cursor-pointer select-none"
+                    >
+                      {track.artwork.large && (
+                        <img
+                          src={track.artwork.large}
+                          alt=""
+                          referrerPolicy="no-referrer"
+                          className={`absolute inset-0 w-full h-full object-cover transition-transform duration-700 ${
+                            isPlaying ? 'scale-110 opacity-40' : 'scale-105 opacity-25'
+                          } blur-2xl`}
+                        />
+                      )}
+                      <div className="absolute inset-0 bg-gradient-to-t from-black/90 via-black/45 to-black/60" />
+
+                      <div className="relative z-10 h-full flex flex-col items-center justify-center p-5 text-center">
+                        <div
+                          className={`w-28 h-28 sm:w-36 sm:h-36 rounded-2xl overflow-hidden shadow-2xl border border-white/[0.14] transition-transform duration-500 ${
+                            isPlaying ? 'scale-100' : 'scale-95 opacity-90'
+                          }`}
+                        >
+                          <ArtworkImage
+                            src={track.artwork.large || track.artwork.medium}
+                            alt={track.title}
+                            className="w-full h-full"
+                            iconSize={36}
+                          />
+                        </div>
+
+                        {/* Equalizer bars synced to playback */}
+                        <div
+                          className="mt-4 flex items-end justify-center gap-1.5 h-8"
+                          aria-hidden="true"
+                        >
+                          {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map((bar) => (
+                            <span
+                              key={bar}
+                              className={`w-1.5 rounded-full bg-emerald-400/90 ${
+                                isPlaying ? 'swara-eq-bar h-full' : 'h-2 opacity-40'
+                              }`}
+                              style={
+                                isPlaying
+                                  ? {
+                                      animationDelay: `${(bar % 5) * 0.14}s`,
+                                      animationDuration: `${0.75 + (bar % 4) * 0.18}s`,
+                                    }
+                                  : undefined
+                              }
+                            />
+                          ))}
+                        </div>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleFullscreen();
+                        }}
+                        className="absolute top-3 right-3 z-20 min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg bg-black/65 text-zinc-200 hover:text-white hover:bg-black/80 transition-colors"
+                        aria-label="Fullscreen cinema stage"
+                        title="Fullscreen"
+                      >
+                        <Maximize2 size={16} />
+                      </button>
+                    </div>
+                    <p className="text-center text-xs text-zinc-400 mt-2.5">
+                      Official music video is not in catalog · Playing synced Cinema Visual for your exact song
+                    </p>
+                  </div>
+                ) : (
+                  <div className="w-full max-w-[330px] mx-auto aspect-square rounded-2xl overflow-hidden shadow-2xl border border-white/[0.08]">
                     <ArtworkImage
                       src={track.artwork.large || track.artwork.medium}
-                      alt={track.title}
+                      alt={`${track.title} album artwork`}
                       className="w-full h-full"
-                      iconSize={36}
+                      iconSize={48}
                     />
                   </div>
-
-                  {/* Equalizer bars synced to playback */}
-                  <div
-                    className="mt-4 flex items-end justify-center gap-1.5 h-8"
-                    aria-hidden="true"
-                  >
-                    {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map((bar) => (
-                      <span
-                        key={bar}
-                        className={`w-1.5 rounded-full bg-emerald-400/90 ${
-                          isPlaying ? 'swara-eq-bar h-full' : 'h-2 opacity-40'
-                        }`}
-                        style={
-                          isPlaying
-                            ? {
-                                animationDelay: `${(bar % 5) * 0.14}s`,
-                                animationDuration: `${0.75 + (bar % 4) * 0.18}s`,
-                              }
-                            : undefined
-                        }
-                      />
-                    ))}
-                  </div>
-                </div>
-
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    handleFullscreen();
-                  }}
-                  className="absolute top-3 right-3 z-20 min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg bg-black/65 text-zinc-200 hover:text-white hover:bg-black/80 transition-colors"
-                  aria-label="Fullscreen cinema stage"
-                  title="Fullscreen"
-                >
-                  <Maximize2 size={16} />
-                </button>
+                )}
               </div>
-              <p className="text-center text-xs text-zinc-400 mt-2.5">
-                Official music video is not in catalog · Playing synced Cinema Visual for your exact song
-              </p>
-            </div>
-          ) : (
-            <div className="w-full max-w-[330px] aspect-square rounded-2xl overflow-hidden shadow-2xl border border-white/[0.08]">
-              <ArtworkImage
-                src={track.artwork.large || track.artwork.medium}
-                alt={`${track.title} album artwork`}
-                className="w-full h-full"
-                iconSize={48}
-              />
-            </div>
+            </>
           )}
 
           <div className={`w-full mt-5 ${isVideo ? 'text-left' : 'max-w-lg text-center'}`}>
@@ -645,7 +730,7 @@ export function NowPlayingSheet({
                 </button>
               )}
 
-              {onSwitchToAudio && track.kind === 'video' && (
+              {onSwitchToAudio && track.kind === 'video' && !audioOnlyVideo && (
                 <button
                   type="button"
                   onClick={() => onSwitchToAudio(track)}
@@ -653,6 +738,17 @@ export function NowPlayingSheet({
                 >
                   <Music size={13} />
                   <span>Switch to Audio</span>
+                </button>
+              )}
+
+              {audioOnlyVideo && onShowVideoStage && (
+                <button
+                  type="button"
+                  onClick={onShowVideoStage}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-emerald-400 hover:text-emerald-300 bg-emerald-500/10 hover:bg-emerald-500/15 border border-emerald-500/20 transition-colors"
+                >
+                  <Video size={13} />
+                  <span>Switch to Video</span>
                 </button>
               )}
 
@@ -842,27 +938,54 @@ export function NowPlayingSheet({
           </div>
         </div>
 
-        {/* Right Side: YouTube-Style Up Next Video Playlist Panel */}
-        {isVideo && (
+        {/* Right Side (Audio Mode Desktop): Real-Time Synced Lyrics Panel */}
+        {!showVideoStage && showDesktopLyrics && (
+          <div className="hidden lg:block w-full">
+            <LyricsPanel
+              track={track}
+              currentTime={currentTime}
+              onSeek={onSeek}
+              className="h-[580px]"
+            />
+          </div>
+        )}
+
+        {/* Right Side (Video Mode): YouTube-Style Up Next Playlist & Synced Lyrics Tabs */}
+        {showVideoStage && (
           <aside className="w-full rounded-2xl bg-[#121419]/95 border border-white/[0.08] overflow-hidden flex flex-col max-h-[600px]">
-            <div className="px-4 py-3.5 border-b border-white/[0.08] flex items-center justify-between gap-2 bg-[#161920]">
-              <div className="min-w-0">
-                <div className="flex items-center gap-2">
-                  <ListMusic size={15} className="text-emerald-400 shrink-0" />
-                  <h3 className="font-display text-sm font-semibold text-white truncate">
-                    Up Next Video Playlist
-                  </h3>
-                </div>
-                <p className="text-[11px] text-zinc-400 mt-0.5">
-                  {playlist.length + 1} videos · Continuous ad-free playback
-                </p>
+            <div className="px-3.5 py-2.5 border-b border-white/[0.08] flex items-center justify-between gap-2 bg-[#161920]">
+              <div className="flex items-center gap-1 p-1 rounded-lg bg-black/30">
+                <button
+                  type="button"
+                  onClick={() => setVideoSidebarTab('playlist')}
+                  className={`min-h-[34px] px-3 py-1 rounded-md text-xs font-medium inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
+                    videoSidebarTab === 'playlist'
+                      ? 'bg-emerald-500 text-zinc-950 font-semibold'
+                      : 'text-zinc-300 hover:text-white'
+                  }`}
+                >
+                  <ListMusic size={13} />
+                  <span>Up Next ({playlist.length + 1})</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setVideoSidebarTab('lyrics')}
+                  className={`min-h-[34px] px-3 py-1 rounded-md text-xs font-medium inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
+                    videoSidebarTab === 'lyrics'
+                      ? 'bg-emerald-500 text-zinc-950 font-semibold'
+                      : 'text-zinc-300 hover:text-white'
+                  }`}
+                >
+                  <FileText size={13} />
+                  <span>Lyrics</span>
+                </button>
               </div>
 
-              {onToggleAutoplay && (
+              {videoSidebarTab === 'playlist' && onToggleAutoplay && (
                 <button
                   type="button"
                   onClick={onToggleAutoplay}
-                  className={`px-2.5 py-1 rounded-lg text-[11px] font-medium border transition-colors whitespace-nowrap shrink-0 ${
+                  className={`px-2.5 py-1.5 rounded-lg text-[11px] font-medium border transition-colors whitespace-nowrap shrink-0 ${
                     autoplayNext
                       ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
                       : 'bg-white/[0.04] text-zinc-400 border-white/[0.08]'
@@ -874,90 +997,99 @@ export function NowPlayingSheet({
               )}
             </div>
 
-            <div className="overflow-y-auto divide-y divide-white/[0.05]">
-              {/* Currently Playing item at top */}
-              <div className="p-3 bg-emerald-500/10 flex items-center gap-3">
-                <span className="w-5 text-center text-[11px] font-mono text-emerald-400 shrink-0">
-                  ▶
-                </span>
-                <div className="relative w-24 aspect-video rounded-lg overflow-hidden bg-black shrink-0">
-                  <ArtworkImage
-                    src={track.artwork.medium || track.artwork.small}
-                    alt={track.title}
-                    className="w-full h-full object-cover"
-                    iconSize={16}
-                  />
-                  {effectiveDuration > 0 && (
-                    <span className="absolute bottom-1 right-1 px-1 py-0.5 rounded bg-black/80 text-[10px] font-mono tabular-nums text-white">
-                      {formatDuration(effectiveDuration)}
-                    </span>
-                  )}
-                </div>
-                <div className="min-w-0 flex-1">
-                  <p className="text-xs font-medium text-emerald-300 line-clamp-2">
-                    {track.title}
-                  </p>
-                  <p className="text-[11px] text-zinc-400 truncate mt-0.5">
-                    {track.artist}
-                  </p>
-                </div>
-              </div>
-
-              {playlist.length === 0 ? (
-                <div className="p-6 text-center text-xs text-zinc-500">
-                  Loading related videos for playlist...
-                </div>
-              ) : (
-                playlist.map((item, idx) => (
-                  <div
-                    key={`${item.id}-${idx}`}
-                    className="group p-3 hover:bg-white/[0.04] transition-colors flex items-center gap-2.5"
-                  >
-                    <span className="w-5 text-center text-[11px] font-mono tabular-nums text-zinc-500 shrink-0">
-                      {idx + 1}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => onSelectPlaylistTrack?.(item)}
-                      className="flex-1 min-w-0 flex items-center gap-3 text-left focus-visible:outline-none"
-                    >
-                      <div className="relative w-24 aspect-video rounded-lg overflow-hidden bg-black shrink-0">
-                        <ArtworkImage
-                          src={item.artwork.medium || item.artwork.small}
-                          alt={item.title}
-                          className="w-full h-full object-cover"
-                          iconSize={16}
-                        />
-                        {item.duration > 0 && (
-                          <span className="absolute bottom-1 right-1 px-1 py-0.5 rounded bg-black/80 text-[10px] font-mono tabular-nums text-white">
-                            {formatDuration(item.duration)}
-                          </span>
-                        )}
-                      </div>
-                      <div className="min-w-0 flex-1">
-                        <p className="text-xs font-medium text-zinc-100 group-hover:text-emerald-300 line-clamp-2 transition-colors">
-                          {item.title}
-                        </p>
-                        <p className="text-[11px] text-zinc-400 truncate mt-0.5">
-                          {item.artist}
-                        </p>
-                      </div>
-                    </button>
-
-                    {onRemovePlaylistTrack && (
-                      <button
-                        type="button"
-                        onClick={() => onRemovePlaylistTrack(idx)}
-                        className="p-1.5 rounded-lg text-zinc-500 hover:text-rose-400 hover:bg-white/[0.06] opacity-70 group-hover:opacity-100 transition-opacity shrink-0"
-                        aria-label={`Remove ${item.title} from playlist`}
-                      >
-                        <X size={14} />
-                      </button>
+            {videoSidebarTab === 'lyrics' ? (
+              <LyricsPanel
+                track={track}
+                currentTime={currentTime}
+                onSeek={onSeek}
+                className="border-0 rounded-none bg-transparent flex-1"
+              />
+            ) : (
+              <div className="overflow-y-auto divide-y divide-white/[0.05]">
+                {/* Currently Playing item at top */}
+                <div className="p-3 bg-emerald-500/10 flex items-center gap-3">
+                  <span className="w-5 text-center text-[11px] font-mono text-emerald-400 shrink-0">
+                    ▶
+                  </span>
+                  <div className="relative w-24 aspect-video rounded-lg overflow-hidden bg-black shrink-0">
+                    <ArtworkImage
+                      src={track.artwork.medium || track.artwork.small}
+                      alt={track.title}
+                      className="w-full h-full object-cover"
+                      iconSize={16}
+                    />
+                    {effectiveDuration > 0 && (
+                      <span className="absolute bottom-1 right-1 px-1 py-0.5 rounded bg-black/80 text-[10px] font-mono tabular-nums text-white">
+                        {formatDuration(effectiveDuration)}
+                      </span>
                     )}
                   </div>
-                ))
-              )}
-            </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-xs font-medium text-emerald-300 line-clamp-2">
+                      {track.title}
+                    </p>
+                    <p className="text-[11px] text-zinc-400 truncate mt-0.5">
+                      {track.artist}
+                    </p>
+                  </div>
+                </div>
+
+                {playlist.length === 0 ? (
+                  <div className="p-6 text-center text-xs text-zinc-500">
+                    Loading related videos for playlist...
+                  </div>
+                ) : (
+                  playlist.map((item, idx) => (
+                    <div
+                      key={`${item.id}-${idx}`}
+                      className="group p-3 hover:bg-white/[0.04] transition-colors flex items-center gap-2.5"
+                    >
+                      <span className="w-5 text-center text-[11px] font-mono tabular-nums text-zinc-500 shrink-0">
+                        {idx + 1}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => onSelectPlaylistTrack?.(item)}
+                        className="flex-1 min-w-0 flex items-center gap-3 text-left focus-visible:outline-none"
+                      >
+                        <div className="relative w-24 aspect-video rounded-lg overflow-hidden bg-black shrink-0">
+                          <ArtworkImage
+                            src={item.artwork.medium || item.artwork.small}
+                            alt={item.title}
+                            className="w-full h-full object-cover"
+                            iconSize={16}
+                          />
+                          {item.duration > 0 && (
+                            <span className="absolute bottom-1 right-1 px-1 py-0.5 rounded bg-black/80 text-[10px] font-mono tabular-nums text-white">
+                              {formatDuration(item.duration)}
+                            </span>
+                          )}
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <p className="text-xs font-medium text-zinc-100 group-hover:text-emerald-300 line-clamp-2 transition-colors">
+                            {item.title}
+                          </p>
+                          <p className="text-[11px] text-zinc-400 truncate mt-0.5">
+                            {item.artist}
+                          </p>
+                        </div>
+                      </button>
+
+                      {onRemovePlaylistTrack && (
+                        <button
+                          type="button"
+                          onClick={() => onRemovePlaylistTrack(idx)}
+                          className="p-1.5 rounded-lg text-zinc-500 hover:text-rose-400 hover:bg-white/[0.06] opacity-70 group-hover:opacity-100 transition-opacity shrink-0"
+                          aria-label={`Remove ${item.title} from playlist`}
+                        >
+                          <X size={14} />
+                        </button>
+                      )}
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
           </aside>
         )}
       </div>

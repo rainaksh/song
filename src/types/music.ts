@@ -120,3 +120,15 @@ export interface CollectionDetail {
   tracks: Track[];
   albums?: AlbumSummary[];
 }
+
+export interface LyricLine {
+  time: number | null;
+  text: string;
+}
+
+export interface LyricsResponse {
+  synced: boolean;
+  lines: LyricLine[];
+  source?: string;
+  instrumental?: boolean;
+}

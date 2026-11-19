@@ -1814,26 +1814,183 @@ async function createServer() {
   app.get('/api/music/match-audio', async (req, res) => {
     const rawTitle = String(req.query.title || '').trim();
     const rawArtist = String(req.query.artist || '').trim();
+    const duration = Number(req.query.duration) || 0;
     if (!rawTitle) {
       return res.json({ track: null });
     }
-    const cleanTitle = decodeEntities(rawTitle)
-      .replace(/#video|#bhojpuri|#song|#trending|full\s*video|official\s*video|4k\s*video|hd\s*video/gi, ' ')
-      .replace(/#\S+/g, ' ')
-      .replace(/\|.*$/, ' ')
+
+    const AUDIO_MATCH_STOP = new Set([
+      'song', 'songs', 'video', 'videos', 'official', 'music', 'audio', 'full',
+      'hd', '4k', '1080p', '720p', 'lyric', 'lyrics', 'lyrical', 'ft', 'feat',
+      'featuring', 'new', 'superhit', 'hit', 'hits', 'latest', 'trending',
+      'bhojpuri', 'hindi', 'punjabi', 'pawan', 'singh', 'khesari', 'lal', 'yadav',
+      'shilpi', 'raj', 'arijit', 'chand', 'jee', 'ji', 'mani', 'meraj', 'pramod',
+      'premi', 'ritesh', 'pandey', 'neelkamal', 'dinesh', 'nirahua', 'kajal',
+      'raghwani', 'amrapali', 'vannu', 'great', 'trimurti', 'tips', 'world',
+      'wave', 'tseries', 'series', 'saregama', 'zee', 'worldwide', 'records',
+      '2022', '2023', '2024', '2025', '2026', 'ke', 'ka', 'ki', 'ko', 'me',
+      'se', 'pe', 'hai', 'ho', 'the', 'and', 'with',
+    ]);
+
+    const normAudioText = (s: string): string =>
+      normalizePhoneticQuery(
+        devanagariToLatin(decodeEntities(s))
+          .normalize('NFD')
+          .replace(/[\u0300-\u036f]/g, '')
+          .replace(/#\S+/g, ' ')
+          .replace(/@\S+/g, ' ')
+          .replace(/\(.*?\)|\[.*?\]/g, ' ')
+          .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+      )
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+
+    const extractSignificantTokens = (s: string): string[] => {
+      const n = normAudioText(s);
+      if (!n) return [];
+      return n.split(' ').filter((w) => w.length >= 2 && !AUDIO_MATCH_STOP.has(w));
+    };
+
+    // Extract candidate song-title segments cleanly without discarding text after "|"
+    const rawParts = decodeEntities(rawTitle)
+      .replace(/@\S+/g, ' ')
       .replace(/[\u{1F300}-\u{1FAFF}]/gu, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-    const q = normalizePhoneticQuery(`${cleanTitle} ${rawArtist}`.trim()) || cleanTitle;
+      .split(/\s*[|]\s*|\s+[-–—]\s+/)
+      .map((part) =>
+        part
+          .replace(/#/g, '')
+          .replace(/\b(full\s*video|official\s*video|4k\s*video|hd\s*video|superhit\s*song|new\s*bhojpuri\s*song(\s*\d{4})?|bhojpuri\s*song(\s*\d{4})?|song\s*\d{4}|ft\.?\s*.*)\b/gi, ' ')
+          .replace(/\s+/g, ' ')
+          .trim()
+      )
+      .filter((part) => part.length >= 3);
+
+    const romanSegments = rawParts.filter((p) => !/[\u0900-\u097F]/.test(p));
+    const candidateSegments = Array.from(
+      new Set([
+        ...romanSegments,
+        ...rawParts.map((p) => devanagariToLatin(p)),
+      ])
+    )
+      .map((s) => normAudioText(s))
+      .filter((s) => s.length >= 3 && extractSignificantTokens(s).length >= 1);
+
+    const artistClean = normAudioText(rawArtist.split(/,|&|\//)[0] || '');
+    const artistTokens = artistClean.split(' ').filter((w) => w.length >= 2);
+    const allContextNorm = normAudioText(`${rawTitle} ${rawArtist}`);
+
+    const searchQueries: string[] = [];
+    for (const seg of [...candidateSegments].reverse()) {
+      const sig = extractSignificantTokens(seg);
+      if (sig.length === 0) continue;
+      if (!searchQueries.includes(seg)) searchQueries.push(seg);
+      const qWithArtist = `${seg} ${artistClean}`.trim();
+      if (artistClean && !searchQueries.includes(qWithArtist)) {
+        searchQueries.push(qWithArtist);
+      }
+      if (searchQueries.length >= 4) break;
+    }
+    if (searchQueries.length === 0) {
+      const fallbackQ = normAudioText(rawTitle);
+      if (fallbackQ) searchQueries.push(fallbackQ);
+    }
+
     try {
-      const tracks = await fetchSongsFromUpstream(q, 1, 8);
-      if (tracks.length === 0) return res.json({ track: null });
-      const scored = tracks
-        .map((t) => ({ t, score: scoreTrackQueryMatch(t, cleanTitle) }))
-        .sort((a, b) => b.score - a.score);
-      res.json({
-        track: scored[0] && scored[0].score >= 55 ? scored[0].t : null,
-      });
+      const batches = await Promise.all(
+        searchQueries.slice(0, 4).map((q) =>
+          Promise.all([
+            fetchSongsFromUpstream(q, 1, 8).catch(() => [] as NormalizedTrack[]),
+            fetchSongsFromAudius(q, 4).catch(() => [] as NormalizedTrack[]),
+          ]).then(([s, a]) => [...s, ...a])
+        )
+      );
+      const candidates = dedupeTracks(batches.flat());
+      if (candidates.length === 0) return res.json({ track: null });
+
+      let bestTrack: NormalizedTrack | null = null;
+      let bestScore = -1;
+      const remixRe = /\b(lofi|lo-fi|remix|dance\s*mix|club\s*mix|party\s*mix|dj\s*mix|mix|slowed|reverb|cover|unplugged|8d|karaoke|instrumental|mashup)\b/i;
+      const videoIsRemix = remixRe.test(rawTitle);
+
+      // Build word set from video title + channel/artist (excluding generic words) to verify the ACTUAL singer
+      const videoWords = new Set(
+        normAudioText(`${rawTitle} ${rawArtist}`)
+          .split(' ')
+          .filter((w) => w.length >= 3 && !new Set(['video', 'song', 'songs', 'official', 'music', 'audio', 'full', 'new', 'bhojpuri', 'hindi', 'superhit', 'trimurti', 'tips', 'world', 'wave', 'records']).has(w))
+      );
+
+      for (const cand of candidates) {
+        const candTitleNorm = normAudioText(cand.title);
+        const candTitleSig = extractSignificantTokens(cand.title);
+        const candArtistNorm = normAudioText(cand.artist);
+        if (!candTitleNorm || candTitleSig.length === 0) continue;
+
+        // Require at least one actual artist name token from the audio track to appear in video title/artist
+        const candArtistWords = candArtistNorm
+          .split(' ')
+          .filter((w) => w.length >= 3 && !new Set(['feat', 'various', 'artists', 'unknown', 'official', 'music', 'records']).has(w));
+        const candArtistMatchedInVideo =
+          candArtistWords.length > 0 && candArtistWords.some((w) => videoWords.has(w));
+        if (!candArtistMatchedInVideo) continue;
+
+        let segBestScore = -1;
+        for (const segNorm of candidateSegments) {
+          const segSig = extractSignificantTokens(segNorm);
+          if (segSig.length === 0) continue;
+
+          const exactMatch = candTitleNorm === segNorm;
+          const phraseMatch =
+            !exactMatch &&
+            segNorm.length >= 5 &&
+            (candTitleNorm.includes(segNorm) || segNorm.includes(candTitleNorm));
+
+          const matchedSeg = segSig.filter((st) =>
+            candTitleSig.some(
+              (ct) =>
+                ct === st ||
+                (st.length >= 4 && ct.length >= 4 && (ct.startsWith(st) || st.startsWith(ct)))
+            )
+          ).length;
+
+          const segRatio = matchedSeg / segSig.length;
+          const candRatio = matchedSeg / candTitleSig.length;
+          const reqAllMatched =
+            segSig.length <= 3 ? matchedSeg === segSig.length : segRatio >= 0.8;
+
+          // Strict verification gate: full title match + actual artist verified in video metadata
+          const passes =
+            (exactMatch && segSig.length >= 1) ||
+            (reqAllMatched && candRatio >= 0.65) ||
+            (phraseMatch && segRatio >= 0.8 && candRatio >= 0.6);
+
+          if (!passes) continue;
+
+          let s = 0;
+          if (exactMatch) s += 130;
+          else if (phraseMatch) s += 75;
+          s += Math.round(segRatio * 55 + candRatio * 45);
+          const artistOverlapCount = candArtistWords.filter((w) => videoWords.has(w)).length;
+          s += Math.min(60, artistOverlapCount * 22);
+          if (!cand.id.startsWith('audius-')) s += 20;
+          if (!videoIsRemix && remixRe.test(cand.title)) {
+            s -= 65;
+          }
+          if (duration > 0 && cand.duration > 0) {
+            const diff = Math.abs(cand.duration - duration);
+            if (diff <= 20) s += 25;
+            else if (diff > 90) s -= 25;
+          }
+          if (s > segBestScore) segBestScore = s;
+        }
+
+        if (segBestScore > bestScore) {
+          bestScore = segBestScore;
+          bestTrack = cand;
+        }
+      }
+
+      res.json({ track: bestScore >= 165 ? bestTrack : null });
     } catch {
       res.json({ track: null });
     }
@@ -1959,6 +2116,267 @@ async function createServer() {
       res.json({ tracks: filtered });
     } catch {
       res.json({ tracks: [] });
+    }
+  });
+
+  interface CachedLyrics {
+    expiresAt: number;
+    payload: {
+      synced: boolean;
+      lines: Array<{ time: number | null; text: string }>;
+      source?: string;
+      instrumental?: boolean;
+    };
+  }
+  const lyricsCache = new Map<string, CachedLyrics>();
+
+  const cleanTitleForLyrics = (raw: string): string =>
+    decodeEntities(raw)
+      .replace(/#\S+/g, ' ')
+      .replace(/\b(full\s*video|official\s*video|lyric(al)?\s*video|audio\s*song|4k\s*video|hd\s*video|superhit\s*song|new\s*bhojpuri\s*song|bhojpuri\s*song)\b/gi, ' ')
+      .replace(/\(from\s*["'][^"']*["']\)/gi, ' ')
+      .replace(/\(feat\.?[^)]*\)|\[feat\.?[^\]]*\]/gi, ' ')
+      .replace(/\([^)]*(?:version|lofi|slowed|reverb|video|audio|hd|4k)[^)]*\)/gi, ' ')
+      .replace(/\[[^\]]*\]/g, ' ')
+      .replace(/\|.*$/, ' ')
+      .replace(/[\u{1F300}-\u{1FAFF}]/gu, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+  const parseLrcLyrics = (
+    lrc: string
+  ): Array<{ time: number | null; text: string }> => {
+    const lines: Array<{ time: number; text: string }> = [];
+    const timeTagRe = /\[(\d{1,3}):(\d{2})(?:\.(\d{1,3}))?\]/g;
+    for (const rawLine of lrc.split(/\r?\n/)) {
+      const times: number[] = [];
+      let match: RegExpExecArray | null;
+      timeTagRe.lastIndex = 0;
+      while ((match = timeTagRe.exec(rawLine)) !== null) {
+        const mins = Number(match[1]) || 0;
+        const secs = Number(match[2]) || 0;
+        const fracRaw = match[3] || '';
+        const frac = fracRaw
+          ? Number(fracRaw) / (fracRaw.length === 3 ? 1000 : fracRaw.length === 2 ? 100 : 10)
+          : 0;
+        times.push(mins * 60 + secs + frac);
+      }
+      const text = rawLine.replace(timeTagRe, '').trim();
+      if (times.length === 0 || !text) continue;
+      for (const t of times) {
+        lines.push({ time: Number(t.toFixed(2)), text });
+      }
+    }
+    lines.sort((a, b) => a.time - b.time);
+    return lines;
+  };
+
+  app.get('/api/music/lyrics', async (req, res) => {
+    const rawTitle = String(req.query.title || '').trim();
+    const rawArtist = String(req.query.artist || '').trim();
+    const rawAlbum = String(req.query.album || '').trim();
+    const duration = Number(req.query.duration) || 0;
+    const trackId = String(req.query.trackId || '').trim();
+
+    if (!rawTitle) {
+      return res.status(400).json({ error: 'Track title is required.' });
+    }
+
+    const cleanTitle = cleanTitleForLyrics(rawTitle) || rawTitle;
+    const primaryArtist = rawArtist
+      .split(/,|&|\//)[0]
+      ?.replace(/-\s*topic$/i, '')
+      .trim() || '';
+    const cacheKey = `${trackId}|${cleanTitle.toLowerCase()}|${primaryArtist.toLowerCase()}`;
+    const cached = lyricsCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return res.json(cached.payload);
+    }
+
+    const saveCache = (payload: CachedLyrics['payload']) => {
+      if (lyricsCache.size > 150) {
+        const firstKey = lyricsCache.keys().next().value;
+        if (firstKey) lyricsCache.delete(firstKey);
+      }
+      lyricsCache.set(cacheKey, {
+        expiresAt: Date.now() + 30 * 60 * 1000,
+        payload,
+      });
+      return payload;
+    };
+
+    interface LrclibRecord {
+      trackName?: string;
+      artistName?: string;
+      duration?: number;
+      instrumental?: boolean;
+      plainLyrics?: string | null;
+      syncedLyrics?: string | null;
+    }
+
+    try {
+      // 1. Try exact LRCLIB lookup
+      if (primaryArtist) {
+        const params = new URLSearchParams({
+          track_name: cleanTitle,
+          artist_name: primaryArtist,
+        });
+        if (rawAlbum && rawAlbum !== 'Single' && rawAlbum !== 'YouTube Music & Video') {
+          params.set('album_name', rawAlbum);
+        }
+        if (duration > 0) params.set('duration', String(Math.round(duration)));
+
+        const controller = new AbortController();
+        const t = setTimeout(() => controller.abort(), 4500);
+        try {
+          const exactRes = await fetch(
+            `https://lrclib.net/api/get?${params.toString()}`,
+            {
+              signal: controller.signal,
+              headers: { 'User-Agent': 'SwaraMusicPlayer/1.0' },
+            }
+          );
+          clearTimeout(t);
+          if (exactRes.ok) {
+            const item = (await exactRes.json()) as LrclibRecord;
+            if (item.instrumental) {
+              return res.json(
+                saveCache({ synced: false, lines: [], source: 'LRCLIB', instrumental: true })
+              );
+            }
+            if (item.syncedLyrics) {
+              const parsed = parseLrcLyrics(item.syncedLyrics);
+              if (parsed.length > 0) {
+                return res.json(
+                  saveCache({ synced: true, lines: parsed, source: 'LRCLIB' })
+                );
+              }
+            }
+            if (item.plainLyrics) {
+              const plain = item.plainLyrics
+                .split(/\r?\n/)
+                .map((l) => l.trim())
+                .filter(Boolean)
+                .map((text) => ({ time: null, text }));
+              if (plain.length > 0) {
+                return res.json(
+                  saveCache({ synced: false, lines: plain, source: 'LRCLIB' })
+                );
+              }
+            }
+          }
+        } catch {
+          clearTimeout(t);
+        }
+      }
+
+      // 2. Fallback to LRCLIB search with fuzzy query variants
+      const searchQueries = [
+        `${cleanTitle} ${primaryArtist}`.trim(),
+        cleanTitle,
+      ].filter((q, idx, arr) => Boolean(q) && arr.indexOf(q) === idx);
+
+      for (const sq of searchQueries) {
+        const controller = new AbortController();
+        const t = setTimeout(() => controller.abort(), 4500);
+        try {
+          const searchRes = await fetch(
+            `https://lrclib.net/api/search?q=${encodeURIComponent(sq)}`,
+            {
+              signal: controller.signal,
+              headers: { 'User-Agent': 'SwaraMusicPlayer/1.0' },
+            }
+          );
+          clearTimeout(t);
+          if (!searchRes.ok) continue;
+          const results = (await searchRes.json()) as LrclibRecord[];
+          if (!Array.isArray(results) || results.length === 0) continue;
+
+          const normTitle = cleanTitle.toLowerCase();
+          const ranked = [...results].sort((a, b) => {
+            const scoreItem = (r: LrclibRecord) => {
+              let s = 0;
+              if (r.syncedLyrics) s += 100;
+              else if (r.plainLyrics) s += 40;
+              const rt = (r.trackName || '').toLowerCase();
+              if (rt === normTitle) s += 60;
+              else if (rt.includes(normTitle) || normTitle.includes(rt)) s += 30;
+              if (
+                primaryArtist &&
+                (r.artistName || '').toLowerCase().includes(primaryArtist.toLowerCase())
+              ) {
+                s += 35;
+              }
+              if (duration > 0 && r.duration) {
+                const diff = Math.abs(r.duration - duration);
+                if (diff <= 5) s += 25;
+                else if (diff <= 15) s += 10;
+                else if (diff > 45) s -= 20;
+              }
+              return s;
+            };
+            return scoreItem(b) - scoreItem(a);
+          });
+
+          const best = ranked[0];
+          if (best?.syncedLyrics) {
+            const parsed = parseLrcLyrics(best.syncedLyrics);
+            if (parsed.length > 0) {
+              return res.json(
+                saveCache({ synced: true, lines: parsed, source: 'LRCLIB' })
+              );
+            }
+          }
+          if (best?.plainLyrics) {
+            const plain = best.plainLyrics
+              .split(/\r?\n/)
+              .map((l) => l.trim())
+              .filter(Boolean)
+              .map((text) => ({ time: null, text }));
+            if (plain.length > 0) {
+              return res.json(
+                saveCache({ synced: false, lines: plain, source: 'LRCLIB' })
+              );
+            }
+          }
+          if (best?.instrumental) {
+            return res.json(
+              saveCache({ synced: false, lines: [], source: 'LRCLIB', instrumental: true })
+            );
+          }
+        } catch {
+          clearTimeout(t);
+        }
+      }
+
+      // 3. Fallback to Saavn song lyrics if available for Indian regional/film tracks
+      if (
+        trackId &&
+        !trackId.startsWith('yt-') &&
+        !trackId.startsWith('dm-') &&
+        !trackId.startsWith('audius-') &&
+        !trackId.startsWith('local-')
+      ) {
+        const saavnLyrics = await fetchSaavnJson<{ lyrics?: string }>(
+          `/songs/${encodeURIComponent(trackId)}/lyrics`
+        ).catch(() => null);
+        if (saavnLyrics?.lyrics) {
+          const plain = decodeEntities(saavnLyrics.lyrics.replace(/<br\s*\/?>/gi, '\n'))
+            .split(/\r?\n/)
+            .map((l) => l.trim())
+            .filter(Boolean)
+            .map((text) => ({ time: null, text }));
+          if (plain.length > 0) {
+            return res.json(
+              saveCache({ synced: false, lines: plain, source: 'JioSaavn' })
+            );
+          }
+        }
+      }
+
+      return res.json(saveCache({ synced: false, lines: [] }));
+    } catch {
+      return res.json({ synced: false, lines: [] });
     }
   });
 

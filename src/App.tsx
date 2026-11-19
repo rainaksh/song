@@ -183,6 +183,7 @@ export default function App() {
   });
   const [nowPlayingOpen, setNowPlayingOpen] = useState(false);
   const [cinemaVisualMode, setCinemaVisualMode] = useState(false);
+  const [videoAudioOnlyMode, setVideoAudioOnlyMode] = useState(false);
   const [videoStandalone, setVideoStandalone] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1);
   const [videoAutoplayNext, setVideoAutoplayNext] = useState(true);
@@ -356,6 +357,9 @@ export default function App() {
 
       if (currentTrack && currentTrack.id !== track.id) {
         setHistory((prev) => [currentTrack, ...prev.slice(0, 29)]);
+        setVideoAudioOnlyMode(false);
+      } else if (!currentTrack) {
+        setVideoAudioOnlyMode(false);
       }
 
       const isEmbedStream = url.startsWith('yt://') || url.startsWith('dm-embed://');
@@ -1089,6 +1093,7 @@ export default function App() {
         );
         if (data.matched && data.video) {
           setCinemaVisualMode(false);
+          setVideoAudioOnlyMode(false);
           playTrack(
             data.video,
             data.candidates && data.candidates.length > 0 ? data.candidates : [data.video]
@@ -1120,81 +1125,46 @@ export default function App() {
 
   const switchToAudioForTrack = useCallback(
     async (track: Track) => {
-      const cleanTitle = track.title.replace(/\(.*?\)|\[.*?\]/g, '').trim();
+      const cleanLabel =
+        track.title
+          .replace(/#\S+/g, ' ')
+          .replace(/\|.*$/, ' ')
+          .replace(/\(.*?\)|\[.*?\]/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim() || track.title;
       const artist = track.primaryArtistName || track.artist.split(',')[0].trim();
-      const query = `${cleanTitle} ${artist}`.trim();
-      showToast(`Switching to audio for "${cleanTitle}"...`);
-
-      const pickBestAudioMatch = (candidates: Track[]): Track | null => {
-        if (!candidates || candidates.length === 0) return null;
-        const norm = (s: string) =>
-          s
-            .replace(/\(.*?\)|\[.*?\]/g, ' ')
-            .replace(/[^\p{L}\p{N}\s]/gu, ' ')
-            .replace(/\s+/g, ' ')
-            .trim()
-            .toLowerCase();
-        const targetNorm = norm(cleanTitle);
-        const targetWords = targetNorm.split(' ').filter((w) => w.length >= 2);
-        const artistFirst = norm(artist).split(' ')[0] || '';
-
-        let best: Track | null = null;
-        let bestScore = -1;
-        for (const cand of candidates) {
-          const candNorm = norm(cand.title);
-          let score = 0;
-          if (candNorm === targetNorm) score += 100;
-          else if (targetNorm && (candNorm.includes(targetNorm) || targetNorm.includes(candNorm))) {
-            score += 60;
-          }
-          if (targetWords.length > 0) {
-            const hits = targetWords.filter((w) => candNorm.includes(w)).length;
-            score += Math.round((hits / targetWords.length) * 40);
-          }
-          if (artistFirst && norm(cand.artist).includes(artistFirst)) {
-            score += 20;
-          }
-          if (score > bestScore) {
-            bestScore = score;
-            best = cand;
-          }
-        }
-        return bestScore >= 35 ? best : null;
-      };
+      showToast(`Switching to audio for "${cleanLabel}"...`);
 
       try {
-        const directAudio = await fetchMatchAudioData(cleanTitle, artist);
+        const directAudio = await fetchMatchAudioData(
+          track.title,
+          artist,
+          track.duration || 0
+        );
         if (directAudio) {
-          setNowPlayingOpen(false);
+          setVideoAudioOnlyMode(false);
           playTrack(directAudio);
           return;
         }
-        const data = await fetchSearchData(query, 10);
-        const audioOnly = (data.tracks || []).filter((t) => t.kind === 'audio');
-        const bestMatch = pickBestAudioMatch(audioOnly);
-        if (bestMatch) {
-          setNowPlayingOpen(false);
-          playTrack(bestMatch, audioOnly);
-          return;
+
+        // Standalone MP3 is not available — never play a wrong song!
+        // Keep playing this exact track's own stream in Audio Cover + Synced Lyrics view.
+        if (currentTrack?.id !== track.id) {
+          playTrack(track);
         }
-        if (cleanTitle) {
-          const fallbackData = await fetchSearchData(cleanTitle, 10);
-          const fallbackAudioOnly = (fallbackData.tracks || []).filter(
-            (t) => t.kind === 'audio'
-          );
-          const fallbackBest = pickBestAudioMatch(fallbackAudioOnly);
-          if (fallbackBest) {
-            setNowPlayingOpen(false);
-            playTrack(fallbackBest, fallbackAudioOnly);
-            return;
-          }
-        }
-        showToast('No audio-only track found — playing full song stream.');
+        setVideoAudioOnlyMode(true);
+        setNowPlayingOpen(true);
+        showToast(`Playing exact audio for "${cleanLabel}"`);
       } catch {
-        showToast('Could not switch to audio right now.');
+        if (currentTrack?.id !== track.id) {
+          playTrack(track);
+        }
+        setVideoAudioOnlyMode(true);
+        setNowPlayingOpen(true);
+        showToast(`Playing exact audio for "${cleanLabel}"`);
       }
     },
-    [playTrack, showToast]
+    [currentTrack?.id, playTrack, showToast]
   );
 
   const handleDirectVideoSubmit = (e: FormEvent) => {
@@ -2860,6 +2830,8 @@ export default function App() {
         onSwitchToAudio={switchToAudioForTrack}
         visualMode={cinemaVisualMode}
         onExitVisualMode={() => setCinemaVisualMode(false)}
+        audioOnlyVideo={videoAudioOnlyMode}
+        onShowVideoStage={() => setVideoAudioOnlyMode(false)}
         videoMuted={!videoStandalone}
         playbackRate={playbackRate}
         onPlaybackRateChange={handlePlaybackRateChange}

@@ -3,6 +3,8 @@ import type {
   ArtistSummary,
   CollectionDetail,
   DiscoverPayload,
+  LyricLine,
+  LyricsResponse,
   PlaylistSummary,
   SearchResponse,
   Track,
@@ -834,29 +836,72 @@ export async function fetchMatchVideoData(
 
 export async function fetchMatchAudioData(
   title: string,
-  artist: string
+  artist: string,
+  duration = 0
 ): Promise<Track | null> {
   if (await isBackendAvailable()) {
     const res = await fetch(
       `/api/music/match-audio?title=${encodeURIComponent(title)}&artist=${encodeURIComponent(
         artist
-      )}`
+      )}&duration=${encodeURIComponent(String(Math.round(duration || 0)))}`
     );
     if (res.ok) {
       const data = (await res.json()) as { track?: Track | null };
-      if (data.track) return data.track;
+      return data.track || null;
     }
   }
-  const cleanTitle = normalizePhoneticQuery(
-    title
-      .replace(/#video|#bhojpuri|#song|full\s*video|official\s*video/gi, ' ')
-      .replace(/#\S+/g, ' ')
-      .replace(/\|.*$/, ' ')
+
+  const STOP = new Set([
+    'song', 'songs', 'video', 'videos', 'official', 'music', 'audio', 'full',
+    'hd', '4k', 'lyric', 'lyrics', 'ft', 'feat', 'new', 'superhit', 'hit',
+    'bhojpuri', 'hindi', 'punjabi', 'ke', 'ka', 'ki', 'ko', 'me', 'se', 'hai',
+  ]);
+  const norm = (s: string) =>
+    normalizePhoneticQuery(
+      decodeHtmlEntities(s)
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/#\S+/g, ' ')
+        .replace(/@\S+/g, ' ')
+        .replace(/\(.*?\)|\[.*?\]/g, ' ')
+        .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    )
       .replace(/\s+/g, ' ')
       .trim()
+      .toLowerCase();
+
+  const segments = decodeHtmlEntities(title)
+    .split(/\s*[|]\s*|\s+[-–—]\s+/)
+    .map((p) => norm(p.replace(/#/g, '')))
+    .filter((p) => p.length >= 3);
+  const querySeg = segments.find((s) => !/^video/.test(s)) || norm(title);
+  if (!querySeg) return null;
+
+  const songs = await directSongs(`${querySeg} ${artist}`.trim(), 8);
+  const querySig = querySeg.split(' ').filter((w) => w.length >= 2 && !STOP.has(w));
+  if (querySig.length === 0) return null;
+
+  const videoWords = new Set(
+    norm(`${title} ${artist}`)
+      .split(' ')
+      .filter((w) => w.length >= 3 && !STOP.has(w))
   );
-  const songs = await directSongs(`${cleanTitle} ${artist}`.trim(), 5);
-  return songs[0] || null;
+
+  for (const s of songs) {
+    const candSig = norm(s.title)
+      .split(' ')
+      .filter((w) => w.length >= 2 && !STOP.has(w));
+    if (candSig.length === 0) continue;
+    const candArtistWords = norm(s.artist)
+      .split(' ')
+      .filter((w) => w.length >= 3);
+    if (!candArtistWords.some((w) => videoWords.has(w))) continue;
+    const matched = querySig.filter((q) => candSig.includes(q)).length;
+    if (matched === querySig.length && matched / candSig.length >= 0.65) {
+      return s;
+    }
+  }
+  return null;
 }
 
 export async function fetchSuggestionsData(
@@ -878,4 +923,124 @@ export async function fetchSuggestionsData(
   if (!firstArtist) return [];
   const tracks = await directSongs(firstArtist, 10);
   return tracks.filter((t) => t.id !== excludeId).slice(0, 8);
+}
+
+function parseLrcClient(lrc: string): LyricLine[] {
+  const lines: Array<{ time: number; text: string }> = [];
+  const timeTagRe = /\[(\d{1,3}):(\d{2})(?:\.(\d{1,3}))?\]/g;
+  for (const rawLine of lrc.split(/\r?\n/)) {
+    const times: number[] = [];
+    let match: RegExpExecArray | null;
+    timeTagRe.lastIndex = 0;
+    while ((match = timeTagRe.exec(rawLine)) !== null) {
+      const mins = Number(match[1]) || 0;
+      const secs = Number(match[2]) || 0;
+      const fracRaw = match[3] || '';
+      const frac = fracRaw
+        ? Number(fracRaw) / (fracRaw.length === 3 ? 1000 : fracRaw.length === 2 ? 100 : 10)
+        : 0;
+      times.push(mins * 60 + secs + frac);
+    }
+    const text = rawLine.replace(timeTagRe, '').trim();
+    if (times.length === 0 || !text) continue;
+    for (const t of times) {
+      lines.push({ time: Number(t.toFixed(2)), text });
+    }
+  }
+  lines.sort((a, b) => a.time - b.time);
+  return lines;
+}
+
+export async function fetchLyricsData(track: Track): Promise<LyricsResponse> {
+  if (await isBackendAvailable()) {
+    try {
+      const params = new URLSearchParams({
+        title: track.title,
+        artist: track.artist,
+        album: track.album,
+        duration: String(track.duration || 0),
+        trackId: track.id,
+      });
+      const res = await fetch(`/api/music/lyrics?${params.toString()}`);
+      if (res.ok) {
+        return (await res.json()) as LyricsResponse;
+      }
+    } catch {
+      // fall through to direct LRCLIB
+    }
+  }
+
+  // Direct LRCLIB client fallback for GitHub Pages static deployment
+  const cleanTitle = decodeHtmlEntities(track.title)
+    .replace(/#\S+/g, ' ')
+    .replace(/\b(full\s*video|official\s*video|lyric(al)?\s*video|audio\s*song|4k\s*video|hd\s*video)\b/gi, ' ')
+    .replace(/\(from\s*["'][^"']*["']\)/gi, ' ')
+    .replace(/\(feat\.?[^)]*\)|\[feat\.?[^\]]*\]/gi, ' ')
+    .replace(/\[[^\]]*\]/g, ' ')
+    .replace(/\|.*$/, ' ')
+    .replace(/\s+/g, ' ')
+    .trim() || track.title;
+  const primaryArtist =
+    track.artist.split(/,|&|\//)[0]?.replace(/-\s*topic$/i, '').trim() || '';
+
+  interface LrclibItem {
+    trackName?: string;
+    artistName?: string;
+    duration?: number;
+    instrumental?: boolean;
+    plainLyrics?: string | null;
+    syncedLyrics?: string | null;
+  }
+
+  const normalizeItem = (item?: LrclibItem | null): LyricsResponse | null => {
+    if (!item) return null;
+    if (item.instrumental) {
+      return { synced: false, lines: [], source: 'LRCLIB', instrumental: true };
+    }
+    if (item.syncedLyrics) {
+      const parsed = parseLrcClient(item.syncedLyrics);
+      if (parsed.length > 0) return { synced: true, lines: parsed, source: 'LRCLIB' };
+    }
+    if (item.plainLyrics) {
+      const plain = item.plainLyrics
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(Boolean)
+        .map((text) => ({ time: null, text }));
+      if (plain.length > 0) return { synced: false, lines: plain, source: 'LRCLIB' };
+    }
+    return null;
+  };
+
+  try {
+    if (primaryArtist) {
+      const p = new URLSearchParams({
+        track_name: cleanTitle,
+        artist_name: primaryArtist,
+      });
+      if (track.duration > 0) p.set('duration', String(Math.round(track.duration)));
+      const exactRes = await fetch(`https://lrclib.net/api/get?${p.toString()}`);
+      if (exactRes.ok) {
+        const hit = normalizeItem((await exactRes.json()) as LrclibItem);
+        if (hit) return hit;
+      }
+    }
+
+    const q = `${cleanTitle} ${primaryArtist}`.trim();
+    const searchRes = await fetch(
+      `https://lrclib.net/api/search?q=${encodeURIComponent(q)}`
+    );
+    if (searchRes.ok) {
+      const list = (await searchRes.json()) as LrclibItem[];
+      if (Array.isArray(list) && list.length > 0) {
+        const syncedFirst = list.find((i) => i.syncedLyrics) || list[0];
+        const hit = normalizeItem(syncedFirst);
+        if (hit) return hit;
+      }
+    }
+  } catch {
+    // ignore network failure
+  }
+
+  return { synced: false, lines: [] };
 }
