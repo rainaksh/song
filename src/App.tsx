@@ -116,6 +116,8 @@ export default function App() {
   const playTrackRef = useRef<(track: Track, list?: Track[]) => void>(() => {});
   const handleNextRef = useRef<() => void>(() => {});
   const handlePrevRef = useRef<() => void>(() => {});
+  const searchSeqRef = useRef(0);
+  const playbackPosRef = useRef({ currentTime: 0, duration: 0 });
 
   // Navigation & Catalog state
   const [view, setView] = useState<AppView>('discover');
@@ -336,10 +338,18 @@ export default function App() {
       }
 
       el.src = url;
-      el.load();
       if (shouldPlay) {
         el.play().catch(() => {
-          onFatalFallback?.();
+          // Wait briefly for buffered readiness if mobile OS delayed initial decode
+          const onCanPlayRetry = () => {
+            el.removeEventListener('canplay', onCanPlayRetry);
+            if (shouldPlay && el.paused && el.src === url) {
+              el.play().catch(() => {
+                onFatalFallback?.();
+              });
+            }
+          };
+          el.addEventListener('canplay', onCanPlayRetry, { once: true });
         });
       }
     },
@@ -751,36 +761,104 @@ export default function App() {
   }, [currentTrack, getActiveMediaElement, handleSeek, history, playTrack]);
 
   useEffect(() => {
+    playbackPosRef.current = { currentTime, duration };
+  }, [currentTime, duration]);
+
+  useEffect(() => {
+    if (audioRef.current) {
+      audioRef.current.setAttribute('playsinline', 'true');
+      audioRef.current.setAttribute('webkit-playsinline', 'true');
+    }
+  }, []);
+
+  useEffect(() => {
     playTrackRef.current = playTrack;
     handleNextRef.current = handleNext;
     handlePrevRef.current = handlePrev;
   }, [playTrack, handleNext, handlePrev]);
 
-  // MediaSession API: Lock Screen & Background controls for BOTH Audio & Video
+  // Pre-fetch upcoming Radio / Video Playlist BEFORE the current song ends so
+  // background / screen-off track transitions start synchronously without an async fetch gap.
+  useEffect(() => {
+    if (!currentTrack || queue.length > 0) return;
+    let cancelled = false;
+
+    const timer = setTimeout(() => {
+      if (currentTrack.kind === 'audio' && autoplayRadio) {
+        fetchSuggestionsData(currentTrack.artist, currentTrack.id)
+          .then((tracks) => {
+            if (cancelled || tracks.length === 0) return;
+            setQueue((prev) => (prev.length === 0 ? tracks : prev));
+          })
+          .catch(() => {});
+      } else if (currentTrack.kind === 'video' && videoAutoplayNext) {
+        const seed =
+          currentTrack.artist && currentTrack.artist !== 'Music Channel'
+            ? `${currentTrack.artist.split(',')[0]} songs`
+            : currentTrack.title.replace(/#Video|#\S+|\(.*?\)|\[.*?\]/gi, ' ').trim();
+        fetchVideosCatalogData(seed || 'hindi hits', 10)
+          .then((videos) => {
+            if (cancelled) return;
+            const filtered = videos.filter((v) => v.id !== currentTrack.id);
+            if (filtered.length > 0) {
+              setQueue((prev) => (prev.length === 0 ? filtered : prev));
+            }
+          })
+          .catch(() => {});
+      }
+    }, 1500);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [currentTrack, queue.length, autoplayRadio, videoAutoplayNext]);
+
+  // MediaSession API: Lock Screen & Background controls for Audio, Direct Video & Embeds
   useEffect(() => {
     if (!currentTrack || !('mediaSession' in navigator)) return;
 
     const artworkList: MediaImage[] = [];
     if (currentTrack.artwork.large) {
-      artworkList.push({ src: currentTrack.artwork.large, sizes: '512x512', type: 'image/jpeg' });
+      artworkList.push({ src: currentTrack.artwork.large, sizes: '512x512' });
     }
     if (currentTrack.artwork.medium) {
-      artworkList.push({ src: currentTrack.artwork.medium, sizes: '150x150', type: 'image/jpeg' });
+      artworkList.push({ src: currentTrack.artwork.medium, sizes: '150x150' });
     }
 
-    navigator.mediaSession.metadata = new MediaMetadata({
-      title: currentTrack.title,
-      artist: currentTrack.artist,
-      album: `${currentTrack.album}${currentTrack.year ? ` (${currentTrack.year})` : ''}`,
-      artwork: artworkList,
-    });
+    try {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: currentTrack.title,
+        artist: currentTrack.artist,
+        album: `${currentTrack.album}${currentTrack.year ? ` (${currentTrack.year})` : ''}`,
+        artwork: artworkList,
+      });
+    } catch {
+      // ignore invalid MediaMetadata fields on older browsers
+    }
 
+    const isYtStream = selectStreamUrl(currentTrack, quality).startsWith('yt://');
     const getEl = () =>
       currentTrack.kind === 'video' && videoStandaloneRef.current
         ? videoRef.current
         : audioRef.current;
 
-    navigator.mediaSession.setActionHandler('play', () => {
+    const safeSetHandler = (
+      action: MediaSessionAction,
+      handler: MediaSessionActionHandler | null
+    ) => {
+      try {
+        navigator.mediaSession.setActionHandler(action, handler);
+      } catch {
+        // unsupported action in this browser
+      }
+    };
+
+    safeSetHandler('play', () => {
+      if (isYtStream && ytControlRef.current) {
+        ytControlRef.current.play();
+        return;
+      }
       const el = getEl();
       el?.play().catch(() => {});
       if (
@@ -794,21 +872,41 @@ export default function App() {
         videoRef.current.play().catch(() => {});
       }
     });
-    navigator.mediaSession.setActionHandler('pause', () => {
+    safeSetHandler('pause', () => {
+      if (isYtStream && ytControlRef.current) {
+        ytControlRef.current.pause();
+        return;
+      }
       getEl()?.pause();
       if (currentTrack.kind === 'video' && !videoStandaloneRef.current) {
         videoRef.current?.pause();
       }
     });
-    navigator.mediaSession.setActionHandler('previoustrack', () => {
+    safeSetHandler('stop', () => {
+      if (isYtStream && ytControlRef.current) {
+        ytControlRef.current.pause();
+        return;
+      }
+      getEl()?.pause();
+      if (currentTrack.kind === 'video' && !videoStandaloneRef.current) {
+        videoRef.current?.pause();
+      }
+    });
+    safeSetHandler('previoustrack', () => {
       handlePrevRef.current();
     });
-    navigator.mediaSession.setActionHandler('nexttrack', () => {
+    safeSetHandler('nexttrack', () => {
       handleNextRef.current();
     });
-    navigator.mediaSession.setActionHandler('seekto', (details) => {
+    safeSetHandler('seekto', (details) => {
+      if (typeof details.seekTime !== 'number') return;
+      if (isYtStream && ytControlRef.current) {
+        ytControlRef.current.seekTo(details.seekTime);
+        setCurrentTime(details.seekTime);
+        return;
+      }
       const el = getEl();
-      if (el && typeof details.seekTime === 'number') {
+      if (el) {
         el.currentTime = details.seekTime;
         if (
           currentTrack.kind === 'video' &&
@@ -820,10 +918,17 @@ export default function App() {
         setCurrentTime(details.seekTime);
       }
     });
-    navigator.mediaSession.setActionHandler('seekbackward', (details) => {
+    safeSetHandler('seekbackward', (details) => {
       const el = getEl();
+      const offset = details.seekOffset || 10;
+      if (isYtStream && ytControlRef.current) {
+        const next = Math.max(0, playbackPosRef.current.currentTime - offset);
+        ytControlRef.current.seekTo(next);
+        setCurrentTime(next);
+        return;
+      }
       if (el) {
-        const next = Math.max(0, el.currentTime - (details.seekOffset || 10));
+        const next = Math.max(0, el.currentTime - offset);
         el.currentTime = next;
         if (
           currentTrack.kind === 'video' &&
@@ -835,10 +940,20 @@ export default function App() {
         setCurrentTime(next);
       }
     });
-    navigator.mediaSession.setActionHandler('seekforward', (details) => {
+    safeSetHandler('seekforward', (details) => {
       const el = getEl();
+      const offset = details.seekOffset || 10;
+      if (isYtStream && ytControlRef.current) {
+        const next = Math.min(
+          playbackPosRef.current.duration || 0,
+          playbackPosRef.current.currentTime + offset
+        );
+        ytControlRef.current.seekTo(next);
+        setCurrentTime(next);
+        return;
+      }
       if (el) {
-        const next = Math.min(el.duration || 0, el.currentTime + (details.seekOffset || 10));
+        const next = Math.min(el.duration || 0, el.currentTime + offset);
         el.currentTime = next;
         if (
           currentTrack.kind === 'video' &&
@@ -850,7 +965,7 @@ export default function App() {
         setCurrentTime(next);
       }
     });
-  }, [currentTrack]);
+  }, [currentTrack, quality]);
 
   // Keep MediaSession playbackState & positionState synced
   useEffect(() => {
@@ -858,23 +973,26 @@ export default function App() {
     navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
 
     const el = getActiveMediaElement();
+    const activeDur = el && Number.isFinite(el.duration) && el.duration > 0 ? el.duration : duration;
+    const activePos = el ? el.currentTime : currentTime;
+    const activeRate = el?.playbackRate || playbackRate || 1;
     if (
-      el &&
-      Number.isFinite(el.duration) &&
-      el.duration > 0 &&
+      activeDur > 0 &&
+      Number.isFinite(activePos) &&
+      activePos >= 0 &&
       'setPositionState' in navigator.mediaSession
     ) {
       try {
         navigator.mediaSession.setPositionState({
-          duration: el.duration,
-          playbackRate: el.playbackRate || 1,
-          position: Math.min(el.currentTime, el.duration),
+          duration: activeDur,
+          playbackRate: activeRate,
+          position: Math.min(activePos, activeDur),
         });
       } catch {
         // ignore invalid position bounds
       }
     }
-  }, [isPlaying, currentTime, getActiveMediaElement]);
+  }, [isPlaying, currentTime, duration, playbackRate, getActiveMediaElement]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -906,10 +1024,12 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [currentTrack, getActiveMediaElement, handleSeek, togglePlay]);
 
-  // Search Execution
+  // Search Execution (sequence-guarded with 9.5s hard failsafe timeout so UI never stays stuck loading)
   const runSearch = useCallback(async (queryText: string) => {
     const clean = queryText.trim();
     if (!clean) return;
+    const reqId = ++searchSeqRef.current;
+
     setSearchQuery(clean);
     setSubmittedQuery(clean);
     setView('search');
@@ -918,14 +1038,25 @@ export default function App() {
     setSearchTab('all');
     setSelectedYear('all');
 
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
     try {
-      const data = await fetchSearchData(clean, 24);
+      const data = await Promise.race([
+        fetchSearchData(clean, 24),
+        new Promise<never>((_, reject) => {
+          timeoutId = setTimeout(() => reject(new Error('Search timed out')), 9500);
+        }),
+      ]);
+      if (reqId !== searchSeqRef.current) return;
       setSearchResults(data);
     } catch {
-      setSearchError('Could not load search results. Please try again.');
+      if (reqId !== searchSeqRef.current) return;
+      setSearchError('Search took too long or network failed. Please try again.');
       setSearchResults(null);
     } finally {
-      setSearchLoading(false);
+      if (timeoutId) clearTimeout(timeoutId);
+      if (reqId === searchSeqRef.current) {
+        setSearchLoading(false);
+      }
     }
   }, []);
 
@@ -1966,8 +2097,17 @@ export default function App() {
               )}
 
               {searchError && !searchLoading && (
-                <div className="p-5 rounded-xl bg-rose-500/10 border border-rose-500/20 text-sm text-rose-200">
-                  {searchError}
+                <div className="p-5 rounded-xl bg-rose-500/10 border border-rose-500/20 text-sm text-rose-200 flex flex-wrap items-center justify-between gap-3">
+                  <span>{searchError}</span>
+                  {submittedQuery && (
+                    <button
+                      type="button"
+                      onClick={() => runSearch(submittedQuery)}
+                      className="px-3.5 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-xs font-semibold text-white transition-colors"
+                    >
+                      Retry Search
+                    </button>
+                  )}
                 </div>
               )}
 

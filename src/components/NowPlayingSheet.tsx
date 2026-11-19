@@ -436,9 +436,11 @@ export function NowPlayingSheet({
             ? isYoutube || isDmEmbed
               ? 'Full Video Theater · Continuous Playlist'
               : 'Video Stage · Screen-Off Background Ready'
-            : showCinemaVisual
-              ? 'Cinema Visual Stage · Background Ready'
-              : 'Audio Stage · Ad-Free'}
+            : isYoutube || isDmEmbed
+              ? 'Audio View · Keep Tab Open for Embeds'
+              : showCinemaVisual
+                ? 'Cinema Visual Stage · Background Ready'
+                : 'Audio Stage · Background & Screen-Off Ready'}
         </span>
 
         <div className="flex items-center gap-1 shrink-0">
@@ -519,7 +521,7 @@ export function NowPlayingSheet({
             <div
               className={
                 audioOnlyVideo
-                  ? 'fixed -left-[9999px] w-px h-px opacity-0 pointer-events-none overflow-hidden'
+                  ? 'fixed bottom-0 right-0 w-16 h-9 opacity-[0.01] pointer-events-none overflow-hidden -z-10'
                   : 'w-full aspect-video rounded-2xl overflow-hidden bg-black border border-white/[0.1] shadow-2xl relative'
               }
             >
@@ -670,13 +672,20 @@ export function NowPlayingSheet({
                     </p>
                   </div>
                 ) : (
-                  <div className="w-full max-w-[330px] mx-auto aspect-square rounded-2xl overflow-hidden shadow-2xl border border-white/[0.08]">
-                    <ArtworkImage
-                      src={track.artwork.large || track.artwork.medium}
-                      alt={`${track.title} album artwork`}
-                      className="w-full h-full"
-                      iconSize={48}
-                    />
+                  <div>
+                    <div className="w-full max-w-[330px] mx-auto aspect-square rounded-2xl overflow-hidden shadow-2xl border border-white/[0.08]">
+                      <ArtworkImage
+                        src={track.artwork.large || track.artwork.medium}
+                        alt={`${track.title} album artwork`}
+                        className="w-full h-full"
+                        iconSize={48}
+                      />
+                    </div>
+                    {audioOnlyVideo && (isYoutube || isDmEmbed) && (
+                      <p className="text-center text-[11px] text-zinc-400 mt-2.5 max-w-[330px] mx-auto">
+                        Exact stream is from an embedded video (browsers pause embeds on screen lock). Play Songs for screen-off playback.
+                      </p>
+                    )}
                   </div>
                 )}
               </div>

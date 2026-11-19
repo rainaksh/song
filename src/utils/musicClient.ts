@@ -13,19 +13,45 @@ import { decodeHtmlEntities } from './format';
 
 const SAAVN_DIRECT_BASE = 'https://saavn.sumit.co/api';
 
-let backendDetected: boolean | null = null;
+function isStaticHostingEnv(): boolean {
+  if (typeof window === 'undefined') return false;
+  const host = window.location.hostname.toLowerCase();
+  return (
+    window.location.protocol === 'file:' ||
+    host.endsWith('.github.io') ||
+    host.endsWith('.pages.dev') ||
+    host.endsWith('.netlify.app')
+  );
+}
+
+async function fetchWithTimeout(
+  url: string,
+  init?: RequestInit,
+  timeoutMs = 4500
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+let backendDetected: boolean | null = isStaticHostingEnv() ? false : null;
 let backendProbePromise: Promise<boolean> | null = null;
 
 export async function isBackendAvailable(): Promise<boolean> {
+  if (isStaticHostingEnv()) {
+    backendDetected = false;
+    return false;
+  }
   if (backendDetected !== null) return backendDetected;
   if (backendProbePromise) return backendProbePromise;
 
   backendProbePromise = (async () => {
     try {
-      const controller = new AbortController();
-      const t = setTimeout(() => controller.abort(), 2500);
-      const res = await fetch('/api/health', { signal: controller.signal });
-      clearTimeout(t);
+      const res = await fetchWithTimeout('/api/health', undefined, 1800);
       const ct = res.headers.get('content-type') || '';
       if (!res.ok || !ct.includes('application/json')) {
         backendDetected = false;
@@ -271,9 +297,9 @@ function dedupeTracks(tracks: Track[], excludeIds = new Set<string>()): Track[] 
   return out;
 }
 
-async function directSaavn<T>(endpoint: string): Promise<T | null> {
+async function directSaavn<T>(endpoint: string, timeoutMs = 4500): Promise<T | null> {
   try {
-    const res = await fetch(`${SAAVN_DIRECT_BASE}${endpoint}`);
+    const res = await fetchWithTimeout(`${SAAVN_DIRECT_BASE}${endpoint}`, undefined, timeoutMs);
     if (!res.ok) return null;
     const json = (await res.json()) as { data?: T };
     return json?.data || null;
@@ -302,8 +328,56 @@ const PHONETIC_REPLACEMENTS: Array<[RegExp, string]> = [
   [/\bserch\b/gi, 'search'],
 ];
 
+const DEVANAGARI_CONSONANTS: Record<string, string> = {
+  क: 'k', ख: 'kh', ग: 'g', घ: 'gh', ङ: 'ng',
+  च: 'ch', छ: 'chh', ज: 'j', झ: 'jh', ञ: 'ny',
+  ट: 't', ठ: 'th', ड: 'd', ढ: 'dh', ण: 'n',
+  त: 't', थ: 'th', द: 'd', ध: 'dh', न: 'n',
+  प: 'p', फ: 'ph', ब: 'b', भ: 'bh', म: 'm',
+  य: 'y', र: 'r', ल: 'l', व: 'v', श: 'sh',
+  ष: 'sh', स: 's', ह: 'h', क़: 'q', ख़: 'kh',
+  ग़: 'gh', ज़: 'z', ड़: 'r', ढ़: 'rh', फ़: 'f',
+};
+const DEVANAGARI_INDEP_VOWELS: Record<string, string> = {
+  अ: 'a', आ: 'aa', इ: 'i', ई: 'ee', उ: 'u', ऊ: 'oo',
+  ऋ: 'ri', ए: 'e', ऐ: 'ai', ओ: 'o', औ: 'au', अं: 'an', अः: 'ah',
+};
+const DEVANAGARI_MATRAS: Record<string, string> = {
+  'ा': 'a', 'ि': 'i', 'ी': 'ee', 'ु': 'u', 'ू': 'oo',
+  'ृ': 'ri', 'े': 'e', 'ै': 'ai', 'ो': 'o', 'ौ': 'au',
+  'ं': 'n', 'ँ': 'n', 'ः': 'h', '्': '',
+};
+
+function devanagariToLatin(input: string): string {
+  if (!/[\u0900-\u097F]/.test(input)) return input;
+  let out = '';
+  const chars = Array.from(input);
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
+    if (DEVANAGARI_INDEP_VOWELS[ch] !== undefined) {
+      out += DEVANAGARI_INDEP_VOWELS[ch];
+    } else if (DEVANAGARI_CONSONANTS[ch] !== undefined) {
+      out += DEVANAGARI_CONSONANTS[ch];
+      const next = chars[i + 1];
+      if (next && DEVANAGARI_MATRAS[next] !== undefined) {
+        out += DEVANAGARI_MATRAS[next];
+        i++;
+      } else if (next && (DEVANAGARI_CONSONANTS[next] !== undefined || DEVANAGARI_INDEP_VOWELS[next] !== undefined)) {
+        out += 'a';
+      }
+    } else if (DEVANAGARI_MATRAS[ch] !== undefined) {
+      out += DEVANAGARI_MATRAS[ch];
+    } else if (ch === ' ') {
+      out += ' ';
+    } else {
+      out += ch;
+    }
+  }
+  return out.replace(/\s+/g, ' ').trim();
+}
+
 function normalizePhoneticQuery(raw: string): string {
-  let out = raw
+  let out = devanagariToLatin(raw)
     .trim()
     .replace(/([a-zA-Z])\1{2,}/g, '$1$1')
     .replace(/\s+/g, ' ');
@@ -318,60 +392,67 @@ function fetchJsonpSuggest(query: string): Promise<string[]> {
     return Promise.resolve([]);
   }
   return new Promise((resolve) => {
+    let settled = false;
     const cbName = `__swaraSuggest_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
     const script = document.createElement('script');
-    const timer = setTimeout(() => {
-      cleanup();
-      resolve([]);
-    }, 2500);
-
     const cleanup = () => {
       clearTimeout(timer);
-      delete (window as unknown as Record<string, unknown>)[cbName];
+      try {
+        delete (window as unknown as Record<string, unknown>)[cbName];
+      } catch {
+        // ignore
+      }
       script.remove();
     };
+    const finish = (val: string[]) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(val);
+    };
+    const timer = setTimeout(() => finish([]), 1800);
 
     (window as unknown as Record<string, unknown>)[cbName] = (data: unknown) => {
-      cleanup();
       if (Array.isArray(data) && Array.isArray(data[1])) {
         const list = (data[1] as Array<string | [string]>)
           .map((item) => (Array.isArray(item) ? String(item[0] || '') : String(item || '')))
           .filter(Boolean);
-        resolve(list.slice(0, 5));
+        finish(list.slice(0, 5));
       } else {
-        resolve([]);
+        finish([]);
       }
     };
 
+    script.async = true;
     script.src = `https://suggestqueries.google.com/complete/search?client=youtube&ds=yt&q=${encodeURIComponent(
       query
     )}&callback=${cbName}`;
-    script.onerror = () => {
-      cleanup();
-      resolve([]);
-    };
+    script.onerror = () => finish([]);
     document.head.appendChild(script);
   });
 }
 
-async function directSongs(query: string, limit = 24): Promise<Track[]> {
+async function directSongs(query: string, limit = 24, timeoutMs = 4500): Promise<Track[]> {
   const data = await directSaavn<{ results?: RawSaavnSong[] }>(
-    `/search/songs?query=${encodeURIComponent(query)}&page=1&limit=${limit}`
+    `/search/songs?query=${encodeURIComponent(query)}&page=1&limit=${limit}`,
+    timeoutMs
   );
   return (data?.results || [])
     .map(normalizeSong)
     .filter((t): t is Track => t !== null);
 }
 
-const DM_NOISE_RE = /\b(status|whatsapp|shorts?|reaction|interview|teaser|trailer|making of|behind the scenes|jukebox|mashup|non[\s-]?stop|all songs)\b/i;
+const DM_NOISE_RE = /\b(status|whatsapp|shorts?|reaction|interview|teaser|trailer|making of|behind the scenes|jukebox|mashup|non[\s-]?stop|all songs|breaking news|live news|news18|aaj tak|abp news)\b/i;
 
-async function directDailymotionVideos(query: string, limit = 12): Promise<Track[]> {
+async function directDailymotionVideos(query: string, limit = 12, timeoutMs = 4500): Promise<Track[]> {
   try {
     const fetchLimit = Math.min(30, Math.max(14, limit * 2));
-    const res = await fetch(
+    const res = await fetchWithTimeout(
       `https://api.dailymotion.com/videos?search=${encodeURIComponent(
         query
-      )}&fields=id,title,duration,owner.screenname,thumbnail_720_url,thumbnail_480_url,thumbnail_240_url,created_time&limit=${fetchLimit}`
+      )}&fields=id,title,duration,owner.screenname,thumbnail_720_url,thumbnail_480_url,thumbnail_240_url,created_time&limit=${fetchLimit}`,
+      undefined,
+      timeoutMs
     );
     if (!res.ok) return [];
     const json = (await res.json()) as {
@@ -419,12 +500,14 @@ async function directDailymotionVideos(query: string, limit = 12): Promise<Track
   }
 }
 
-async function directAudiusSongs(query: string, limit = 6): Promise<Track[]> {
+async function directAudiusSongs(query: string, limit = 6, timeoutMs = 3500): Promise<Track[]> {
   try {
-    const res = await fetch(
+    const res = await fetchWithTimeout(
       `https://api.audius.co/v1/tracks/search?query=${encodeURIComponent(
         query
-      )}&app_name=Swara`
+      )}&app_name=Swara`,
+      undefined,
+      timeoutMs
     );
     if (!res.ok) return [];
     const json = (await res.json()) as {
@@ -471,6 +554,63 @@ async function directAudiusSongs(query: string, limit = 6): Promise<Track[]> {
   } catch {
     return [];
   }
+}
+
+async function directItunesSongs(query: string, limit = 12, timeoutMs = 3800): Promise<Track[]> {
+  try {
+    const res = await fetchWithTimeout(
+      `https://itunes.apple.com/search?term=${encodeURIComponent(
+        query
+      )}&media=music&entity=song&limit=${limit}&country=IN`,
+      undefined,
+      timeoutMs
+    );
+    if (!res.ok) return [];
+    const json = (await res.json()) as { results?: RawItunesVideo[] };
+    const out: Track[] = [];
+    for (const raw of json.results || []) {
+      if (!raw.trackId || !raw.previewUrl) continue;
+      const art100 = raw.artworkUrl100 || '';
+      const art300 = art100 ? art100.replace('100x100bb', '300x300bb') : '';
+      const art600 = art100 ? art100.replace('100x100bb', '600x600bb') : '';
+      const yearStr = raw.releaseDate ? raw.releaseDate.slice(0, 4) : '';
+      out.push({
+        id: `itunes-au-${raw.trackId}`,
+        kind: 'audio',
+        title: raw.trackName || 'Untitled Track',
+        artist: raw.artistName || 'Unknown Artist',
+        album: raw.collectionName || 'Single',
+        year: yearStr,
+        releaseDate: formatLaunchDate(raw.releaseDate, yearStr),
+        duration: raw.trackTimeMillis ? Math.round(raw.trackTimeMillis / 1000) : 30,
+        language: raw.primaryGenreName || 'Music',
+        artwork: { small: art100, medium: art300, large: art600 },
+        streams: [{ quality: '160kbps', url: raw.previewUrl }],
+      });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let nextIdx = 0;
+  const worker = async () => {
+    while (nextIdx < items.length) {
+      const idx = nextIdx++;
+      results[idx] = await fn(items[idx]);
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, items.length) }, () => worker())
+  );
+  return results;
 }
 
 const STATIC_DISCOVER_SEEDS = [
@@ -526,27 +666,31 @@ const STATIC_DISCOVER_SEEDS = [
 
 export async function fetchDiscoverData(): Promise<DiscoverPayload> {
   if (await isBackendAvailable()) {
-    const res = await fetch('/api/music/discover');
-    if (res.ok) return (await res.json()) as DiscoverPayload;
+    try {
+      const res = await fetchWithTimeout('/api/music/discover', undefined, 8000);
+      if (res.ok) return (await res.json()) as DiscoverPayload;
+    } catch {
+      // fall through
+    }
   }
 
   const [shelves, playlistRes, albumRes, artistRes, bhojpuriArtistRes] = await Promise.all([
-    Promise.all(
-      STATIC_DISCOVER_SEEDS.map(async (seed) => ({
-        ...seed,
-        tracks:
-          seed.kind === 'video'
-            ? await directDailymotionVideos(`${seed.query} video song`, 8)
-            : await directSongs(seed.query, 8),
-      }))
-    ),
+    mapWithConcurrency(STATIC_DISCOVER_SEEDS, 4, async (seed) => ({
+      ...seed,
+      tracks:
+        seed.kind === 'video'
+          ? await directDailymotionVideos(`${seed.query} video song`, 8, 4500)
+          : await directSongs(seed.query, 8, 4500),
+    })),
     directSaavn<{ results?: RawSaavnPlaylist[] }>(
-      '/search/playlists?query=top%20hindi&limit=8'
+      '/search/playlists?query=top%20hindi&limit=8',
+      4500
     ),
     directSaavn<{ results?: RawSaavnAlbum[] }>(
-      '/search/albums?query=bollywood%20hits&limit=8'
+      '/search/albums?query=bollywood%20hits&limit=8',
+      4500
     ),
-    Promise.all(
+    mapWithConcurrency(
       [
         'Arijit Singh',
         'Kishore Kumar',
@@ -556,13 +700,15 @@ export async function fetchDiscoverData(): Promise<DiscoverPayload> {
         'AR Rahman',
         'Kumar Sanu',
         'Diljit Dosanjh',
-      ].map((singer) =>
+      ],
+      4,
+      (singer) =>
         directSaavn<{ results?: RawSaavnArtist[] }>(
-          `/search/artists?query=${encodeURIComponent(singer)}&limit=1`
+          `/search/artists?query=${encodeURIComponent(singer)}&limit=1`,
+          4000
         )
-      )
     ),
-    Promise.all(
+    mapWithConcurrency(
       [
         'Pawan Singh',
         'Khesari Lal Yadav',
@@ -572,11 +718,13 @@ export async function fetchDiscoverData(): Promise<DiscoverPayload> {
         'Neelkamal Singh',
         'Ritesh Pandey',
         'Akshara Singh',
-      ].map((singer) =>
+      ],
+      4,
+      (singer) =>
         directSaavn<{ results?: RawSaavnArtist[] }>(
-          `/search/artists?query=${encodeURIComponent(singer)}&limit=1`
+          `/search/artists?query=${encodeURIComponent(singer)}&limit=1`,
+          4000
         )
-      )
     ),
   ]);
 
@@ -602,43 +750,62 @@ export async function fetchSearchData(
   limit = 24
 ): Promise<SearchResponse> {
   if (await isBackendAvailable()) {
-    const res = await fetch(
-      `/api/music/search?query=${encodeURIComponent(query)}&limit=${limit}`
-    );
-    if (res.ok) return (await res.json()) as SearchResponse;
+    try {
+      const res = await fetchWithTimeout(
+        `/api/music/search?query=${encodeURIComponent(query)}&limit=${limit}`,
+        undefined,
+        9000
+      );
+      if (res.ok) return (await res.json()) as SearchResponse;
+    } catch {
+      // fall through
+    }
   }
 
-  const phoneticQuery = normalizePhoneticQuery(query);
+  const phoneticQuery = normalizePhoneticQuery(query) || query.trim();
+  const saavnQuery = phoneticQuery;
+
   const [rawTracks, suggestions, videos, audiusTracks, albumData, playlistData, artistData] =
     await Promise.all([
-      directSongs(query, limit),
-      fetchJsonpSuggest(query),
-      directDailymotionVideos(`${phoneticQuery} video song`, 12),
-      directAudiusSongs(phoneticQuery, 6),
+      directSongs(saavnQuery, limit, 4500).catch(() => []),
+      fetchJsonpSuggest(saavnQuery).catch(() => []),
+      directDailymotionVideos(`${phoneticQuery} video song`, 12, 4500).catch(() => []),
+      directAudiusSongs(phoneticQuery, 6, 3500).catch(() => []),
       directSaavn<{ results?: RawSaavnAlbum[] }>(
-        `/search/albums?query=${encodeURIComponent(phoneticQuery)}&limit=12`
-      ),
+        `/search/albums?query=${encodeURIComponent(phoneticQuery)}&limit=12`,
+        4000
+      ).catch(() => null),
       directSaavn<{ results?: RawSaavnPlaylist[] }>(
-        `/search/playlists?query=${encodeURIComponent(phoneticQuery)}&limit=10`
-      ),
+        `/search/playlists?query=${encodeURIComponent(phoneticQuery)}&limit=10`,
+        4000
+      ).catch(() => null),
       directSaavn<{ results?: RawSaavnArtist[] }>(
-        `/search/artists?query=${encodeURIComponent(phoneticQuery)}&limit=8`
-      ),
+        `/search/artists?query=${encodeURIComponent(phoneticQuery)}&limit=8`,
+        4000
+      ).catch(() => null),
     ]);
 
   const corrected =
-    suggestions[0] && suggestions[0].toLowerCase() !== query.toLowerCase()
+    suggestions[0] && suggestions[0].toLowerCase() !== saavnQuery.toLowerCase()
       ? suggestions[0]
-      : phoneticQuery !== query
+      : phoneticQuery.toLowerCase() !== query.trim().toLowerCase()
         ? phoneticQuery
         : '';
 
-  const extraTracks =
-    corrected && corrected.toLowerCase() !== query.toLowerCase()
-      ? await directSongs(corrected, limit)
-      : [];
+  const needExtraQuery =
+    corrected &&
+    corrected.toLowerCase() !== saavnQuery.toLowerCase() &&
+    rawTracks.length < 6;
 
-  const tracks = dedupeTracks([...rawTracks, ...extraTracks, ...audiusTracks]);
+  const extraTracks = needExtraQuery
+    ? await directSongs(corrected, limit, 3500).catch(() => [])
+    : [];
+
+  let tracks = dedupeTracks([...rawTracks, ...extraTracks, ...audiusTracks]);
+  if (tracks.length === 0) {
+    tracks = await directItunesSongs(phoneticQuery, 12, 3500).catch(() => []);
+  }
+
   const seenIds = new Set(tracks.map((t) => t.id));
   const seedTrack = tracks[0];
   const seedTerms: string[] = [];
@@ -651,9 +818,12 @@ export async function fetchSearchData(
       seedTerms.push(seedTrack.album);
     }
   }
-  const similarBatches = await Promise.all(
-    seedTerms.slice(0, 2).map((term) => directSongs(term, 12))
-  );
+  const similarBatches =
+    seedTerms.length > 0
+      ? await Promise.all(
+          seedTerms.slice(0, 2).map((term) => directSongs(term, 10, 3000).catch(() => []))
+        )
+      : [];
 
   return {
     query,
@@ -687,7 +857,7 @@ export async function fetchCollectionData(
           : `/api/music/artist?id=${encodeURIComponent(id)}&name=${encodeURIComponent(
               nameFallback
             )}`;
-    const res = await fetch(url);
+    const res = await fetchWithTimeout(url, undefined, 7000);
     if (res.ok) return (await res.json()) as CollectionDetail;
   }
 
@@ -777,16 +947,22 @@ export async function fetchVideosCatalogData(
   limit = 24
 ): Promise<Track[]> {
   if (await isBackendAvailable()) {
-    const res = await fetch(
-      `/api/music/videos?query=${encodeURIComponent(query)}&limit=${limit}`
-    );
-    if (res.ok) {
-      const data = (await res.json()) as { videos?: Track[] };
-      return data.videos || [];
+    try {
+      const res = await fetchWithTimeout(
+        `/api/music/videos?query=${encodeURIComponent(query)}&limit=${limit}`,
+        undefined,
+        7000
+      );
+      if (res.ok) {
+        const data = (await res.json()) as { videos?: Track[] };
+        return data.videos || [];
+      }
+    } catch {
+      // fall through
     }
   }
   const clean = normalizePhoneticQuery(query) || query;
-  return directDailymotionVideos(`${clean} video song`, limit);
+  return directDailymotionVideos(`${clean} video song`, limit, 4500);
 }
 
 export async function fetchMatchVideoData(
@@ -795,17 +971,23 @@ export async function fetchMatchVideoData(
   album: string
 ): Promise<{ matched: boolean; video: Track | null; candidates: Track[] }> {
   if (await isBackendAvailable()) {
-    const res = await fetch(
-      `/api/music/match-video?title=${encodeURIComponent(title)}&artist=${encodeURIComponent(
-        artist
-      )}&album=${encodeURIComponent(album)}`
-    );
-    if (res.ok) {
-      return (await res.json()) as {
-        matched: boolean;
-        video: Track | null;
-        candidates: Track[];
-      };
+    try {
+      const res = await fetchWithTimeout(
+        `/api/music/match-video?title=${encodeURIComponent(title)}&artist=${encodeURIComponent(
+          artist
+        )}&album=${encodeURIComponent(album)}`,
+        undefined,
+        7000
+      );
+      if (res.ok) {
+        return (await res.json()) as {
+          matched: boolean;
+          video: Track | null;
+          candidates: Track[];
+        };
+      }
+    } catch {
+      // fall through
     }
   }
 
@@ -821,7 +1003,7 @@ export async function fetchMatchVideoData(
 
   const reqNorm = norm(title);
   const artistFirst = norm(artist.split(',')[0] || '');
-  const list = await directDailymotionVideos(`${reqNorm} ${artistFirst}`.trim(), 10);
+  const list = await directDailymotionVideos(`${reqNorm} ${artistFirst}`.trim(), 10, 4500);
   const matched = list.filter((v) => {
     const vNorm = norm(v.title);
     const artistOk = !artistFirst || norm(v.artist).includes(artistFirst) || vNorm.includes(artistFirst);
@@ -840,14 +1022,20 @@ export async function fetchMatchAudioData(
   duration = 0
 ): Promise<Track | null> {
   if (await isBackendAvailable()) {
-    const res = await fetch(
-      `/api/music/match-audio?title=${encodeURIComponent(title)}&artist=${encodeURIComponent(
-        artist
-      )}&duration=${encodeURIComponent(String(Math.round(duration || 0)))}`
-    );
-    if (res.ok) {
-      const data = (await res.json()) as { track?: Track | null };
-      return data.track || null;
+    try {
+      const res = await fetchWithTimeout(
+        `/api/music/match-audio?title=${encodeURIComponent(title)}&artist=${encodeURIComponent(
+          artist
+        )}&duration=${encodeURIComponent(String(Math.round(duration || 0)))}`,
+        undefined,
+        6500
+      );
+      if (res.ok) {
+        const data = (await res.json()) as { track?: Track | null };
+        return data.track || null;
+      }
+    } catch {
+      // fall through
     }
   }
 
@@ -877,7 +1065,7 @@ export async function fetchMatchAudioData(
   const querySeg = segments.find((s) => !/^video/.test(s)) || norm(title);
   if (!querySeg) return null;
 
-  const songs = await directSongs(`${querySeg} ${artist}`.trim(), 8);
+  const songs = await directSongs(`${querySeg} ${artist}`.trim(), 8, 4500);
   const querySig = querySeg.split(' ').filter((w) => w.length >= 2 && !STOP.has(w));
   if (querySig.length === 0) return null;
 
@@ -909,19 +1097,25 @@ export async function fetchSuggestionsData(
   excludeId: string
 ): Promise<Track[]> {
   if (await isBackendAvailable()) {
-    const res = await fetch(
-      `/api/music/suggestions?artist=${encodeURIComponent(
-        artist
-      )}&excludeId=${encodeURIComponent(excludeId)}`
-    );
-    if (res.ok) {
-      const data = (await res.json()) as { tracks?: Track[] };
-      return data.tracks || [];
+    try {
+      const res = await fetchWithTimeout(
+        `/api/music/suggestions?artist=${encodeURIComponent(
+          artist
+        )}&excludeId=${encodeURIComponent(excludeId)}`,
+        undefined,
+        5500
+      );
+      if (res.ok) {
+        const data = (await res.json()) as { tracks?: Track[] };
+        return data.tracks || [];
+      }
+    } catch {
+      // fall through
     }
   }
   const firstArtist = artist.split(',')[0].trim();
   if (!firstArtist) return [];
-  const tracks = await directSongs(firstArtist, 10);
+  const tracks = await directSongs(firstArtist, 10, 4000);
   return tracks.filter((t) => t.id !== excludeId).slice(0, 8);
 }
 
@@ -961,7 +1155,7 @@ export async function fetchLyricsData(track: Track): Promise<LyricsResponse> {
         duration: String(track.duration || 0),
         trackId: track.id,
       });
-      const res = await fetch(`/api/music/lyrics?${params.toString()}`);
+      const res = await fetchWithTimeout(`/api/music/lyrics?${params.toString()}`, undefined, 5500);
       if (res.ok) {
         return (await res.json()) as LyricsResponse;
       }
@@ -1019,7 +1213,7 @@ export async function fetchLyricsData(track: Track): Promise<LyricsResponse> {
         artist_name: primaryArtist,
       });
       if (track.duration > 0) p.set('duration', String(Math.round(track.duration)));
-      const exactRes = await fetch(`https://lrclib.net/api/get?${p.toString()}`);
+      const exactRes = await fetchWithTimeout(`https://lrclib.net/api/get?${p.toString()}`, undefined, 4000);
       if (exactRes.ok) {
         const hit = normalizeItem((await exactRes.json()) as LrclibItem);
         if (hit) return hit;
@@ -1027,8 +1221,10 @@ export async function fetchLyricsData(track: Track): Promise<LyricsResponse> {
     }
 
     const q = `${cleanTitle} ${primaryArtist}`.trim();
-    const searchRes = await fetch(
-      `https://lrclib.net/api/search?q=${encodeURIComponent(q)}`
+    const searchRes = await fetchWithTimeout(
+      `https://lrclib.net/api/search?q=${encodeURIComponent(q)}`,
+      undefined,
+      4000
     );
     if (searchRes.ok) {
       const list = (await searchRes.json()) as LrclibItem[];
