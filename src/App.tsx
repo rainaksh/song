@@ -190,7 +190,14 @@ export default function App() {
   const [playbackRate, setPlaybackRate] = useState(1);
   const [videoAutoplayNext, setVideoAutoplayNext] = useState(true);
   const [toastMessage, setToastMessage] = useState('');
+  const [bgAudioSynced, setBgAudioSynced] = useState(false);
   const ytControlRef = useRef<YouTubePlayerControls | null>(null);
+  const dmControlRef = useRef<YouTubePlayerControls | null>(null);
+  const matchedBgAudioRef = useRef<Track | null>(null);
+  const bgHandoffActiveRef = useRef(false);
+  const bgUnlockingRef = useRef(false);
+  const isPlayingRef = useRef(false);
+  const isEmbedTrackRef = useRef(false);
 
   const showToast = useCallback((msg: string) => {
     setToastMessage(msg);
@@ -289,6 +296,7 @@ export default function App() {
   }, []);
 
   const getActiveMediaElement = useCallback((): HTMLMediaElement | null => {
+    if (bgHandoffActiveRef.current) return audioRef.current;
     if (currentTrack?.kind === 'video' && videoStandaloneRef.current) {
       return videoRef.current;
     }
@@ -372,13 +380,49 @@ export default function App() {
         setVideoAudioOnlyMode(false);
       }
 
+      const SILENT_WAV =
+        'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
       const isEmbedStream = url.startsWith('yt://') || url.startsWith('dm-embed://');
+      const isHlsVideo =
+        track.kind === 'video' &&
+        (url.includes('/api/music/hls-manifest') || /\.m3u8(\?|$)/i.test(url));
+
+      const unlockAudioForMobileBg = () => {
+        const audio = audioRef.current;
+        if (!audio) return;
+        bgUnlockingRef.current = true;
+        audio.muted = true;
+        audio.src = SILENT_WAV;
+        audio
+          .play()
+          .then(() => {
+            audio.pause();
+            audio.muted = false;
+            audio.volume = isMuted ? 0 : volume;
+            bgUnlockingRef.current = false;
+          })
+          .catch(() => {
+            audio.muted = false;
+            audio.volume = isMuted ? 0 : volume;
+            bgUnlockingRef.current = false;
+          });
+      };
 
       // If clicking the exact same track, toggle play/pause
       if (currentTrack?.id === track.id) {
+        if (bgHandoffActiveRef.current && audioRef.current) {
+          if (audioRef.current.paused) audioRef.current.play().catch(() => {});
+          else audioRef.current.pause();
+          return;
+        }
         if (url.startsWith('yt://') && ytControlRef.current) {
           if (isPlaying) ytControlRef.current.pause();
           else ytControlRef.current.play();
+          return;
+        }
+        if (url.startsWith('dm-embed://') && dmControlRef.current) {
+          if (isPlaying) dmControlRef.current.pause();
+          else dmControlRef.current.play();
           return;
         }
         if (track.kind === 'video' && !videoStandaloneRef.current && !isEmbedStream) {
@@ -445,8 +489,12 @@ export default function App() {
         }
       }
 
-      videoStandaloneRef.current = false;
-      setVideoStandalone(false);
+      bgHandoffActiveRef.current = false;
+      matchedBgAudioRef.current = null;
+      setBgAudioSynced(false);
+      isEmbedTrackRef.current = isEmbedStream;
+      videoStandaloneRef.current = isHlsVideo;
+      setVideoStandalone(isHlsVideo);
 
       if (track.kind === 'video') {
         setCinemaVisualMode(false);
@@ -470,7 +518,6 @@ export default function App() {
       setIsPlaying(true);
 
       if (isEmbedStream) {
-        // Pause native <audio> & <video> when YouTube / Dailymotion embed player takes over
         if (audioHlsRef.current) {
           audioHlsRef.current.destroy();
           audioHlsRef.current = null;
@@ -479,25 +526,55 @@ export default function App() {
           videoHlsRef.current.destroy();
           videoHlsRef.current = null;
         }
-        if (audioRef.current) {
-          audioRef.current.pause();
-          audioRef.current.removeAttribute('src');
-        }
         if (videoRef.current) {
           videoRef.current.pause();
           videoRef.current.removeAttribute('src');
         }
+        unlockAudioForMobileBg();
+        return;
+      }
+
+      // HLS video streams carry muxed H.264+AAC (video/mp2t) which <audio> MSE cannot buffer.
+      // Play cleanly on <video> and unlock <audio> in user gesture for verified background audio handoff.
+      if (isHlsVideo) {
+        if (audioHlsRef.current) {
+          audioHlsRef.current.destroy();
+          audioHlsRef.current = null;
+        }
+        unlockAudioForMobileBg();
+        requestAnimationFrame(() => {
+          const vid = videoRef.current;
+          if (!vid) return;
+          vid.muted = isMuted;
+          vid.volume = isMuted ? 0 : volume;
+          vid.playbackRate = playbackRate;
+          attachMediaStream(vid, url, videoHlsRef, true, () => {
+            setIsPlaying(false);
+            setIsBuffering(false);
+          });
+        });
         return;
       }
 
       // Start HTML5 Audio synchronously inside user gesture so mobile OS
-      // keeps playback alive in background & screen-off.
+      // keeps playback alive in background & screen-off (audio songs + local MP4/WebM).
       const audio = audioRef.current;
       if (audio) {
         audio.muted = false;
         audio.volume = isMuted ? 0 : volume;
         audio.playbackRate = playbackRate;
         attachMediaStream(audio, url, audioHlsRef, true, () => {
+          if (track.kind === 'video' && !videoStandaloneRef.current && videoRef.current) {
+            videoStandaloneRef.current = true;
+            setVideoStandalone(true);
+            videoRef.current.muted = isMuted;
+            videoRef.current.volume = isMuted ? 0 : volume;
+            videoRef.current.play().catch(() => {
+              setIsPlaying(false);
+              setIsBuffering(false);
+            });
+            return;
+          }
           setIsPlaying(false);
           setIsBuffering(false);
         });
@@ -516,6 +593,32 @@ export default function App() {
     [attachMediaStream, currentTrack, isMuted, isPlaying, playbackRate, quality, showToast, volume]
   );
 
+  // Pre-resolve an exact verified audio companion for any playing Video so locking the screen
+  // or switching apps seamlessly hands off playback to background-capable HTML5 <audio>.
+  useEffect(() => {
+    matchedBgAudioRef.current = null;
+    setBgAudioSynced(false);
+    if (!currentTrack || currentTrack.kind !== 'video') return;
+    if (currentTrack.id.startsWith('local-')) {
+      setBgAudioSynced(true);
+      return;
+    }
+
+    let cancelled = false;
+    const cleanArtist = currentTrack.primaryArtistName || currentTrack.artist.split(',')[0].trim();
+    fetchMatchAudioData(currentTrack.title, cleanArtist, currentTrack.duration || 0)
+      .then((matched) => {
+        if (cancelled || !matched) return;
+        matchedBgAudioRef.current = matched;
+        setBgAudioSynced(true);
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+    };
+  }, [currentTrack]);
+
   // If quality changes mid-playback for an audio track, swap stream cleanly keeping timestamp
   useEffect(() => {
     if (!currentTrack || currentTrack.kind !== 'audio') return;
@@ -532,7 +635,7 @@ export default function App() {
     }
   }, [quality, currentTrack]);
 
-  // Sync volume & mute to audio, video, and YouTube embed player
+  // Sync volume & mute to audio, video, YouTube, and Dailymotion embed players
   useEffect(() => {
     const effectiveVol = isMuted ? 0 : volume;
     if (audioRef.current) audioRef.current.volume = effectiveVol;
@@ -546,14 +649,96 @@ export default function App() {
       ytControlRef.current.setVolume(volume);
       ytControlRef.current.setMute(isMuted);
     }
+    if (dmControlRef.current) {
+      dmControlRef.current.setVolume(volume);
+      dmControlRef.current.setMute(isMuted);
+    }
   }, [volume, isMuted, currentTrack?.kind, videoStandalone]);
 
-  // Re-sync muted <video> canvas seamlessly when user turns screen back on / returns to tab
+  // Background Video Playback + Screen-Off / Tab-Switch Seamless Handoff & Resume
   useEffect(() => {
     const onVisibilityChange = () => {
-      if (document.hidden) return;
+      if (!currentTrack || currentTrack.kind !== 'video') return;
+
+      if (document.hidden) {
+        if (!isPlayingRef.current) return;
+
+        // If we have an exact verified audio companion (for YouTube, Dailymotion embed, or HLS),
+        // hand off immediately to <audio> at the exact timestamp so screen-off playback continues!
+        const matched = matchedBgAudioRef.current;
+        const audio = audioRef.current;
+        if (matched && audio && !bgHandoffActiveRef.current) {
+          const bgUrl = selectStreamUrl(matched, quality);
+          if (bgUrl) {
+            const curPos = playbackPosRef.current.currentTime || 0;
+            ytControlRef.current?.pause();
+            dmControlRef.current?.pause();
+            if (videoRef.current && !videoRef.current.paused) {
+              videoRef.current.pause();
+            }
+            bgHandoffActiveRef.current = true;
+            audio.muted = isMuted;
+            audio.volume = isMuted ? 0 : volume;
+            audio.playbackRate = playbackRate;
+            audio.src = bgUrl;
+            const targetTime =
+              matched.duration > 4
+                ? Math.min(curPos, Math.max(0, matched.duration - 2))
+                : curPos;
+            if (targetTime > 0) {
+              audio.addEventListener(
+                'loadedmetadata',
+                () => {
+                  try {
+                    audio.currentTime = targetTime;
+                  } catch {
+                    // ignore out-of-range seek
+                  }
+                },
+                { once: true }
+              );
+            }
+            audio.play().catch(() => {});
+            return;
+          }
+        }
+
+        // Fallback for standalone <video> (HLS/direct MP4 without audio match):
+        // nudge playback once if mobile/desktop browser auto-paused <video> on tab hide.
+        if (videoStandaloneRef.current && videoRef.current) {
+          const vid = videoRef.current;
+          setTimeout(() => {
+            if (document.hidden && isPlayingRef.current && vid.paused) {
+              vid.play().catch(() => {});
+            }
+          }, 180);
+        }
+        return;
+      }
+
+      // Returned to foreground (!document.hidden): hand back cleanly from background audio to video
+      if (bgHandoffActiveRef.current && audioRef.current) {
+        const audio = audioRef.current;
+        const resumePos = audio.currentTime || playbackPosRef.current.currentTime || 0;
+        const shouldResume = !audio.paused || isPlayingRef.current;
+        bgHandoffActiveRef.current = false;
+        audio.pause();
+
+        const streamUrl = selectStreamUrl(currentTrack, quality);
+        if (streamUrl.startsWith('yt://') && ytControlRef.current) {
+          ytControlRef.current.seekTo(resumePos);
+          if (shouldResume) ytControlRef.current.play();
+        } else if (streamUrl.startsWith('dm-embed://') && dmControlRef.current) {
+          dmControlRef.current.seekTo(resumePos);
+          if (shouldResume) dmControlRef.current.play();
+        } else if (videoRef.current) {
+          videoRef.current.currentTime = resumePos;
+          if (shouldResume) videoRef.current.play().catch(() => {});
+        }
+        return;
+      }
+
       if (
-        currentTrack?.kind === 'video' &&
         !videoStandaloneRef.current &&
         audioRef.current &&
         videoRef.current
@@ -574,14 +759,24 @@ export default function App() {
     };
     document.addEventListener('visibilitychange', onVisibilityChange);
     return () => document.removeEventListener('visibilitychange', onVisibilityChange);
-  }, [currentTrack?.kind]);
+  }, [currentTrack, isMuted, playbackRate, quality, volume]);
 
   const togglePlay = useCallback(() => {
     if (!currentTrack) return;
+    if (bgHandoffActiveRef.current && audioRef.current) {
+      if (audioRef.current.paused) audioRef.current.play().catch(() => {});
+      else audioRef.current.pause();
+      return;
+    }
     const streamUrl = selectStreamUrl(currentTrack, quality);
     if (streamUrl.startsWith('yt://') && ytControlRef.current) {
       if (isPlaying) ytControlRef.current.pause();
       else ytControlRef.current.play();
+      return;
+    }
+    if (streamUrl.startsWith('dm-embed://') && dmControlRef.current) {
+      if (isPlaying) dmControlRef.current.pause();
+      else dmControlRef.current.play();
       return;
     }
 
@@ -615,8 +810,19 @@ export default function App() {
 
   const handleSeek = useCallback(
     (time: number) => {
-      if (currentTrack && selectStreamUrl(currentTrack, quality).startsWith('yt://')) {
+      if (bgHandoffActiveRef.current && audioRef.current) {
+        audioRef.current.currentTime = time;
+        setCurrentTime(time);
+        return;
+      }
+      const streamUrl = currentTrack ? selectStreamUrl(currentTrack, quality) : '';
+      if (streamUrl.startsWith('yt://')) {
         ytControlRef.current?.seekTo(time);
+        setCurrentTime(time);
+        return;
+      }
+      if (streamUrl.startsWith('dm-embed://')) {
+        dmControlRef.current?.seekTo(time);
         setCurrentTime(time);
         return;
       }
@@ -646,9 +852,20 @@ export default function App() {
     if (!currentTrack) return;
 
     if (repeat === 'one') {
-      if (selectStreamUrl(currentTrack, quality).startsWith('yt://')) {
+      if (bgHandoffActiveRef.current && audioRef.current) {
+        audioRef.current.currentTime = 0;
+        audioRef.current.play().catch(() => {});
+        return;
+      }
+      const streamUrl = selectStreamUrl(currentTrack, quality);
+      if (streamUrl.startsWith('yt://')) {
         ytControlRef.current?.seekTo(0);
         ytControlRef.current?.play();
+        return;
+      }
+      if (streamUrl.startsWith('dm-embed://')) {
+        dmControlRef.current?.seekTo(0);
+        dmControlRef.current?.play();
         return;
       }
       const el = getActiveMediaElement();
@@ -765,6 +982,10 @@ export default function App() {
   }, [currentTime, duration]);
 
   useEffect(() => {
+    isPlayingRef.current = isPlaying;
+  }, [isPlaying]);
+
+  useEffect(() => {
     if (audioRef.current) {
       audioRef.current.setAttribute('playsinline', 'true');
       audioRef.current.setAttribute('webkit-playsinline', 'true');
@@ -837,11 +1058,15 @@ export default function App() {
       // ignore invalid MediaMetadata fields on older browsers
     }
 
-    const isYtStream = selectStreamUrl(currentTrack, quality).startsWith('yt://');
-    const getEl = () =>
-      currentTrack.kind === 'video' && videoStandaloneRef.current
+    const streamUrl = selectStreamUrl(currentTrack, quality);
+    const isYtStream = streamUrl.startsWith('yt://');
+    const isDmStream = streamUrl.startsWith('dm-embed://');
+    const getEl = () => {
+      if (bgHandoffActiveRef.current) return audioRef.current;
+      return currentTrack.kind === 'video' && videoStandaloneRef.current
         ? videoRef.current
         : audioRef.current;
+    };
 
     const safeSetHandler = (
       action: MediaSessionAction,
@@ -855,8 +1080,16 @@ export default function App() {
     };
 
     safeSetHandler('play', () => {
+      if (bgHandoffActiveRef.current && audioRef.current) {
+        audioRef.current.play().catch(() => {});
+        return;
+      }
       if (isYtStream && ytControlRef.current) {
         ytControlRef.current.play();
+        return;
+      }
+      if (isDmStream && dmControlRef.current) {
+        dmControlRef.current.play();
         return;
       }
       const el = getEl();
@@ -873,8 +1106,16 @@ export default function App() {
       }
     });
     safeSetHandler('pause', () => {
+      if (bgHandoffActiveRef.current && audioRef.current) {
+        audioRef.current.pause();
+        return;
+      }
       if (isYtStream && ytControlRef.current) {
         ytControlRef.current.pause();
+        return;
+      }
+      if (isDmStream && dmControlRef.current) {
+        dmControlRef.current.pause();
         return;
       }
       getEl()?.pause();
@@ -883,8 +1124,16 @@ export default function App() {
       }
     });
     safeSetHandler('stop', () => {
+      if (bgHandoffActiveRef.current && audioRef.current) {
+        audioRef.current.pause();
+        return;
+      }
       if (isYtStream && ytControlRef.current) {
         ytControlRef.current.pause();
+        return;
+      }
+      if (isDmStream && dmControlRef.current) {
+        dmControlRef.current.pause();
         return;
       }
       getEl()?.pause();
@@ -900,8 +1149,18 @@ export default function App() {
     });
     safeSetHandler('seekto', (details) => {
       if (typeof details.seekTime !== 'number') return;
+      if (bgHandoffActiveRef.current && audioRef.current) {
+        audioRef.current.currentTime = details.seekTime;
+        setCurrentTime(details.seekTime);
+        return;
+      }
       if (isYtStream && ytControlRef.current) {
         ytControlRef.current.seekTo(details.seekTime);
+        setCurrentTime(details.seekTime);
+        return;
+      }
+      if (isDmStream && dmControlRef.current) {
+        dmControlRef.current.seekTo(details.seekTime);
         setCurrentTime(details.seekTime);
         return;
       }
@@ -921,9 +1180,15 @@ export default function App() {
     safeSetHandler('seekbackward', (details) => {
       const el = getEl();
       const offset = details.seekOffset || 10;
-      if (isYtStream && ytControlRef.current) {
+      if (!bgHandoffActiveRef.current && isYtStream && ytControlRef.current) {
         const next = Math.max(0, playbackPosRef.current.currentTime - offset);
         ytControlRef.current.seekTo(next);
+        setCurrentTime(next);
+        return;
+      }
+      if (!bgHandoffActiveRef.current && isDmStream && dmControlRef.current) {
+        const next = Math.max(0, playbackPosRef.current.currentTime - offset);
+        dmControlRef.current.seekTo(next);
         setCurrentTime(next);
         return;
       }
@@ -943,12 +1208,21 @@ export default function App() {
     safeSetHandler('seekforward', (details) => {
       const el = getEl();
       const offset = details.seekOffset || 10;
-      if (isYtStream && ytControlRef.current) {
+      if (!bgHandoffActiveRef.current && isYtStream && ytControlRef.current) {
         const next = Math.min(
           playbackPosRef.current.duration || 0,
           playbackPosRef.current.currentTime + offset
         );
         ytControlRef.current.seekTo(next);
+        setCurrentTime(next);
+        return;
+      }
+      if (!bgHandoffActiveRef.current && isDmStream && dmControlRef.current) {
+        const next = Math.min(
+          playbackPosRef.current.duration || 0,
+          playbackPosRef.current.currentTime + offset
+        );
+        dmControlRef.current.seekTo(next);
         setCurrentTime(next);
         return;
       }
@@ -1366,15 +1640,24 @@ export default function App() {
         ref={audioRef}
         preload="auto"
         onTimeUpdate={() => {
+          if (bgUnlockingRef.current) return;
           const audio = audioRef.current;
           if (!audio) return;
-          if (currentTrack?.kind === 'video' && videoStandaloneRef.current) return;
+          if (
+            currentTrack?.kind === 'video' &&
+            (videoStandaloneRef.current || isEmbedTrackRef.current) &&
+            !bgHandoffActiveRef.current
+          ) {
+            return;
+          }
           setCurrentTime(audio.currentTime);
 
           // Keep visible muted <video> frame-synced while screen is on
           if (
             currentTrack?.kind === 'video' &&
             !videoStandaloneRef.current &&
+            !isEmbedTrackRef.current &&
+            !bgHandoffActiveRef.current &&
             videoRef.current &&
             !document.hidden
           ) {
@@ -1389,17 +1672,35 @@ export default function App() {
           }
         }}
         onLoadedMetadata={() => {
+          if (bgUnlockingRef.current) return;
+          if (
+            currentTrack?.kind === 'video' &&
+            (videoStandaloneRef.current || isEmbedTrackRef.current) &&
+            !bgHandoffActiveRef.current
+          ) {
+            return;
+          }
           if (audioRef.current && Number.isFinite(audioRef.current.duration)) {
             setDuration(audioRef.current.duration);
           }
           setIsBuffering(false);
         }}
         onPlay={() => {
+          if (bgUnlockingRef.current) return;
+          if (
+            currentTrack?.kind === 'video' &&
+            (videoStandaloneRef.current || isEmbedTrackRef.current) &&
+            !bgHandoffActiveRef.current
+          ) {
+            return;
+          }
           setIsPlaying(true);
           setIsBuffering(false);
           if (
             currentTrack?.kind === 'video' &&
             !videoStandaloneRef.current &&
+            !isEmbedTrackRef.current &&
+            !bgHandoffActiveRef.current &&
             videoRef.current &&
             audioRef.current &&
             !document.hidden
@@ -1413,11 +1714,20 @@ export default function App() {
           }
         }}
         onPause={() => {
-          if (currentTrack?.kind === 'video' && videoStandaloneRef.current) return;
+          if (bgUnlockingRef.current) return;
+          if (
+            currentTrack?.kind === 'video' &&
+            (videoStandaloneRef.current || isEmbedTrackRef.current) &&
+            !bgHandoffActiveRef.current
+          ) {
+            return;
+          }
           setIsPlaying(false);
           if (
             currentTrack?.kind === 'video' &&
             !videoStandaloneRef.current &&
+            !isEmbedTrackRef.current &&
+            !bgHandoffActiveRef.current &&
             videoRef.current &&
             !videoRef.current.paused
           ) {
@@ -1425,15 +1735,41 @@ export default function App() {
           }
         }}
         onWaiting={() => {
-          if (currentTrack?.kind === 'video' && videoStandaloneRef.current) return;
+          if (bgUnlockingRef.current) return;
+          if (
+            currentTrack?.kind === 'video' &&
+            (videoStandaloneRef.current || isEmbedTrackRef.current) &&
+            !bgHandoffActiveRef.current
+          ) {
+            return;
+          }
           setIsBuffering(true);
         }}
-        onCanPlay={() => setIsBuffering(false)}
+        onCanPlay={() => {
+          if (bgUnlockingRef.current) return;
+          setIsBuffering(false);
+        }}
         onEnded={() => {
-          if (currentTrack?.kind === 'video' && videoStandaloneRef.current) return;
+          if (bgUnlockingRef.current) return;
+          if (
+            currentTrack?.kind === 'video' &&
+            (videoStandaloneRef.current || isEmbedTrackRef.current) &&
+            !bgHandoffActiveRef.current
+          ) {
+            return;
+          }
+          bgHandoffActiveRef.current = false;
           handleNextRef.current();
         }}
         onError={() => {
+          if (bgUnlockingRef.current) return;
+          if (bgHandoffActiveRef.current) {
+            bgHandoffActiveRef.current = false;
+            return;
+          }
+          if (currentTrack?.kind === 'video' && (videoStandaloneRef.current || isEmbedTrackRef.current)) {
+            return;
+          }
           // If <audio> fails to decode an exotic video container, fall back to standalone <video>
           if (currentTrack?.kind === 'video' && !videoStandaloneRef.current && videoRef.current) {
             videoStandaloneRef.current = true;
@@ -2976,7 +3312,10 @@ export default function App() {
         playbackRate={playbackRate}
         onPlaybackRateChange={handlePlaybackRateChange}
         ytControlRef={ytControlRef}
+        dmControlRef={dmControlRef}
+        bgAudioSynced={bgAudioSynced}
         onYtTimeUpdate={(cur, dur) => {
+          if (bgHandoffActiveRef.current) return;
           setCurrentTime(cur);
           if (dur > 0) setDuration(dur);
         }}
@@ -2990,6 +3329,7 @@ export default function App() {
         }}
         onRemovePlaylistTrack={(idx) => removeFromQueue(idx)}
         onVideoTimeUpdate={() => {
+          if (bgHandoffActiveRef.current) return;
           if (videoStandaloneRef.current && videoRef.current) {
             setCurrentTime(videoRef.current.currentTime);
           }
@@ -2997,6 +3337,10 @@ export default function App() {
         onVideoLoadedMetadata={() => {
           const vid = videoRef.current;
           if (!vid) return;
+          if (isEmbedTrackRef.current) {
+            setIsBuffering(false);
+            return;
+          }
           if (!videoStandaloneRef.current && audioRef.current) {
             vid.muted = true;
             vid.playbackRate = audioRef.current.playbackRate || 1;
@@ -3014,6 +3358,10 @@ export default function App() {
         onVideoCanPlay={() => {
           const vid = videoRef.current;
           if (!vid) return;
+          if (isEmbedTrackRef.current) {
+            setIsBuffering(false);
+            return;
+          }
           if (!videoStandaloneRef.current && audioRef.current) {
             vid.muted = true;
             vid.playbackRate = audioRef.current.playbackRate || 1;
@@ -3028,12 +3376,18 @@ export default function App() {
           }
         }}
         onVideoEnded={() => {
-          if (videoStandaloneRef.current) {
+          if (bgHandoffActiveRef.current) return;
+          if (videoStandaloneRef.current || isEmbedTrackRef.current) {
             handleNextRef.current();
           }
         }}
         onVideoPlayState={(playing) => {
-          if (videoStandaloneRef.current) {
+          if (bgHandoffActiveRef.current) return;
+          if (videoStandaloneRef.current || isEmbedTrackRef.current) {
+            if (!playing && document.hidden) {
+              // Ignore browser auto-pause while background handoff/resume logic handles it
+              return;
+            }
             setIsPlaying(playing);
             if (playing) setIsBuffering(false);
             return;
@@ -3053,7 +3407,8 @@ export default function App() {
           }
         }}
         onVideoWaiting={(waiting) => {
-          if (videoStandaloneRef.current) setIsBuffering(waiting);
+          if (bgHandoffActiveRef.current) return;
+          if (videoStandaloneRef.current || isEmbedTrackRef.current) setIsBuffering(waiting);
         }}
       />
     </div>

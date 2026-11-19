@@ -136,7 +136,9 @@ interface NowPlayingSheetProps {
   onVideoPlayState: (playing: boolean) => void;
   onVideoWaiting: (waiting: boolean) => void;
   ytControlRef?: MutableRefObject<YouTubePlayerControls | null>;
+  dmControlRef?: MutableRefObject<YouTubePlayerControls | null>;
   onYtTimeUpdate?: (current: number, dur: number) => void;
+  bgAudioSynced?: boolean;
   playlist?: Track[];
   autoplayNext?: boolean;
   onToggleAutoplay?: () => void;
@@ -189,7 +191,9 @@ export function NowPlayingSheet({
   onVideoPlayState,
   onVideoWaiting,
   ytControlRef,
+  dmControlRef,
   onYtTimeUpdate,
+  bgAudioSynced = false,
   playlist = [],
   autoplayNext = true,
   onToggleAutoplay,
@@ -202,6 +206,8 @@ export function NowPlayingSheet({
   const ytContainerRef = useRef<HTMLDivElement | null>(null);
   const ytPlayerRef = useRef<YTPlayerInstance | null>(null);
   const loadedYtIdRef = useRef<string>('');
+  const dmIframeRef = useRef<HTMLIFrameElement | null>(null);
+  const dmTimeRef = useRef({ cur: 0, dur: 0 });
   const [showDesktopLyrics, setShowDesktopLyrics] = useState(true);
   const [mobileAudioView, setMobileAudioView] = useState<'media' | 'lyrics'>('media');
   const [videoSidebarTab, setVideoSidebarTab] = useState<'playlist' | 'lyrics'>('playlist');
@@ -356,6 +362,97 @@ export function NowPlayingSheet({
     return () => clearInterval(id);
   }, [isYoutube, isPlaying]);
 
+  // Wire Dailymotion Embed postMessage control & live progress tracking
+  useEffect(() => {
+    if (!isDmEmbed || !dmEmbedId) {
+      if (dmControlRef) dmControlRef.current = null;
+      dmTimeRef.current = { cur: 0, dur: 0 };
+      return;
+    }
+
+    const sendDmCommand = (command: string, parameters?: unknown[]) => {
+      const win = dmIframeRef.current?.contentWindow;
+      if (!win) return;
+      try {
+        win.postMessage(
+          JSON.stringify(parameters ? { command, parameters } : { command }),
+          'https://www.dailymotion.com'
+        );
+      } catch {
+        // ignore cross-origin postMessage timing before load
+      }
+    };
+
+    if (dmControlRef) {
+      dmControlRef.current = {
+        play: () => sendDmCommand('play'),
+        pause: () => sendDmCommand('pause'),
+        seekTo: (s: number) => sendDmCommand('seek', [Math.max(0, s)]),
+        setVolume: (v: number) => sendDmCommand('volume', [Math.max(0, Math.min(1, v))]),
+        setMute: (m: boolean) => sendDmCommand('muted', [m]),
+        setPlaybackRate: () => {},
+      };
+    }
+
+    const onMessage = (event: MessageEvent) => {
+      if (!event.origin.includes('dailymotion.com')) return;
+      let payload: Record<string, unknown> | null = null;
+      if (typeof event.data === 'string') {
+        try {
+          payload = JSON.parse(event.data) as Record<string, unknown>;
+        } catch {
+          const params = new URLSearchParams(event.data);
+          const evName = params.get('event');
+          if (evName) {
+            payload = {
+              event: evName,
+              time: params.get('time'),
+              duration: params.get('duration'),
+            };
+          }
+        }
+      } else if (event.data && typeof event.data === 'object') {
+        payload = event.data as Record<string, unknown>;
+      }
+      if (!payload) return;
+
+      const ev = String(payload.event || '');
+      if (ev === 'apiready') {
+        sendDmCommand('volume', [callbacksRef.current.volume]);
+        sendDmCommand('muted', [callbacksRef.current.isMuted]);
+        callbacksRef.current.onVideoWaiting(false);
+        callbacksRef.current.onVideoLoadedMetadata();
+        callbacksRef.current.onVideoCanPlay?.();
+      } else if (ev === 'timeupdate') {
+        const cur = Number(payload.time);
+        if (Number.isFinite(cur)) {
+          dmTimeRef.current.cur = cur;
+          callbacksRef.current.onYtTimeUpdate?.(cur, dmTimeRef.current.dur);
+        }
+      } else if (ev === 'durationchange') {
+        const dur = Number(payload.duration);
+        if (Number.isFinite(dur) && dur > 0) {
+          dmTimeRef.current.dur = dur;
+          callbacksRef.current.onYtTimeUpdate?.(dmTimeRef.current.cur, dur);
+        }
+      } else if (ev === 'play' || ev === 'playing') {
+        callbacksRef.current.onVideoWaiting(false);
+        callbacksRef.current.onVideoPlayState(true);
+      } else if (ev === 'pause') {
+        callbacksRef.current.onVideoPlayState(false);
+      } else if (ev === 'waiting' || ev === 'stalled') {
+        callbacksRef.current.onVideoWaiting(true);
+      } else if (ev === 'end' || ev === 'ended' || ev === 'video_end') {
+        callbacksRef.current.onVideoEnded();
+      }
+    };
+
+    window.addEventListener('message', onMessage);
+    return () => {
+      window.removeEventListener('message', onMessage);
+    };
+  }, [isDmEmbed, dmEmbedId, dmControlRef]);
+
   if (!track) return null;
 
   const showVideoStage = isVideo && !audioOnlyVideo;
@@ -433,14 +530,14 @@ export function NowPlayingSheet({
 
         <span className="text-xs font-medium text-zinc-400 tracking-wide truncate px-2">
           {showVideoStage
-            ? isYoutube || isDmEmbed
-              ? 'Full Video Theater · Continuous Playlist'
-              : 'Video Stage · Screen-Off Background Ready'
-            : isYoutube || isDmEmbed
-              ? 'Audio View · Keep Tab Open for Embeds'
-              : showCinemaVisual
+            ? bgAudioSynced || (!isYoutube && !isDmEmbed)
+              ? 'Video Stage · Screen-Off Background Ready'
+              : 'Full Video Theater · Continuous Playlist'
+            : bgAudioSynced || (!isYoutube && !isDmEmbed)
+              ? showCinemaVisual
                 ? 'Cinema Visual Stage · Background Ready'
-                : 'Audio Stage · Background & Screen-Off Ready'}
+                : 'Audio Stage · Background & Screen-Off Ready'
+              : 'Audio View · Keep Tab Open for Embeds'}
         </span>
 
         <div className="flex items-center gap-1 shrink-0">
@@ -529,10 +626,11 @@ export function NowPlayingSheet({
                 <div ref={ytContainerRef} className="w-full h-full bg-black" />
               ) : isDmEmbed ? (
                 <iframe
+                  ref={dmIframeRef}
                   key={dmEmbedId}
                   src={`https://www.dailymotion.com/embed/video/${encodeURIComponent(
                     dmEmbedId
-                  )}?autoplay=1&queue-enable=false`}
+                  )}?autoplay=1&queue-enable=false&api=postMessage`}
                   title={track.title}
                   allow="autoplay; fullscreen; picture-in-picture"
                   allowFullScreen
@@ -681,9 +779,9 @@ export function NowPlayingSheet({
                         iconSize={48}
                       />
                     </div>
-                    {audioOnlyVideo && (isYoutube || isDmEmbed) && (
+                    {audioOnlyVideo && (isYoutube || isDmEmbed) && !bgAudioSynced && (
                       <p className="text-center text-[11px] text-zinc-400 mt-2.5 max-w-[330px] mx-auto">
-                        Exact stream is from an embedded video (browsers pause embeds on screen lock). Play Songs for screen-off playback.
+                        Exact stream is from an embedded video (browsers pause embeds on screen lock). Songs & matched tracks support screen-off playback.
                       </p>
                     )}
                   </div>
