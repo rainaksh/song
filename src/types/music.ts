@@ -101,6 +101,7 @@ export interface DiscoverPayload {
 
 export interface SearchResponse {
   query: string;
+  correctedQuery?: string;
   tracks: Track[];
   videos: Track[];
   similar: Track[];

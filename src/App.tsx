@@ -33,7 +33,7 @@ import {
 } from 'lucide-react';
 import heroImage from './assets/images/hero_listening_room_1794531039131.jpg';
 import { ArtworkImage } from './components/ArtworkImage';
-import { NowPlayingSheet } from './components/NowPlayingSheet';
+import { NowPlayingSheet, type YouTubePlayerControls } from './components/NowPlayingSheet';
 import { PlayerBar } from './components/PlayerBar';
 import { TrackRow } from './components/TrackRow';
 import type {
@@ -54,6 +54,7 @@ import { formatDuration, selectStreamUrl } from './utils/format';
 import {
   fetchCollectionData,
   fetchDiscoverData,
+  fetchMatchAudioData,
   fetchMatchVideoData,
   fetchSearchData,
   fetchSuggestionsData,
@@ -184,7 +185,9 @@ export default function App() {
   const [cinemaVisualMode, setCinemaVisualMode] = useState(false);
   const [videoStandalone, setVideoStandalone] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1);
+  const [videoAutoplayNext, setVideoAutoplayNext] = useState(true);
   const [toastMessage, setToastMessage] = useState('');
+  const ytControlRef = useRef<YouTubePlayerControls | null>(null);
 
   const showToast = useCallback((msg: string) => {
     setToastMessage(msg);
@@ -355,9 +358,16 @@ export default function App() {
         setHistory((prev) => [currentTrack, ...prev.slice(0, 29)]);
       }
 
+      const isEmbedStream = url.startsWith('yt://') || url.startsWith('dm-embed://');
+
       // If clicking the exact same track, toggle play/pause
       if (currentTrack?.id === track.id) {
-        if (track.kind === 'video' && !videoStandaloneRef.current) {
+        if (url.startsWith('yt://') && ytControlRef.current) {
+          if (isPlaying) ytControlRef.current.pause();
+          else ytControlRef.current.play();
+          return;
+        }
+        if (track.kind === 'video' && !videoStandaloneRef.current && !isEmbedStream) {
           const audio = audioRef.current;
           const vid = videoRef.current;
           if (audio) {
@@ -373,7 +383,7 @@ export default function App() {
             }
             return;
           }
-        } else {
+        } else if (!isEmbedStream) {
           const el = track.kind === 'video' ? videoRef.current : audioRef.current;
           if (el) {
             if (el.paused) {
@@ -387,13 +397,37 @@ export default function App() {
       }
 
       // Populate upcoming queue from contextList if provided
+      let populatedFromContext = false;
       if (contextList && contextList.length > 1) {
         const idx = contextList.findIndex((t) => t.id === track.id);
         if (idx !== -1) {
           const upcoming = contextList.slice(idx + 1);
           if (upcoming.length > 0) {
             setQueue(upcoming);
+            populatedFromContext = true;
           }
+        }
+      }
+
+      // If starting a video without upcoming videos, auto-build a YouTube-style Up Next Video Playlist
+      if (track.kind === 'video' && !populatedFromContext) {
+        const seedTerm =
+          track.artist && track.artist !== 'Music Video' && track.artist !== 'Music Channel'
+            ? `${track.artist.split(',')[0]} songs`
+            : track.title.replace(/#Video|#\S+|\(.*?\)|\[.*?\]/gi, ' ').trim();
+        if (seedTerm) {
+          fetchVideosCatalogData(seedTerm, 10)
+            .then((related) => {
+              const filtered = related.filter((v) => v.id !== track.id);
+              if (filtered.length > 0) {
+                setQueue((prev) => {
+                  const existingVideoIds = new Set(prev.map((q) => q.id));
+                  const fresh = filtered.filter((v) => !existingVideoIds.has(v.id));
+                  return prev.length === 0 ? fresh : [...prev, ...fresh.slice(0, 6)];
+                });
+              }
+            })
+            .catch(() => {});
         }
       }
 
@@ -421,6 +455,27 @@ export default function App() {
       setIsBuffering(true);
       setIsPlaying(true);
 
+      if (isEmbedStream) {
+        // Pause native <audio> & <video> when YouTube / Dailymotion embed player takes over
+        if (audioHlsRef.current) {
+          audioHlsRef.current.destroy();
+          audioHlsRef.current = null;
+        }
+        if (videoHlsRef.current) {
+          videoHlsRef.current.destroy();
+          videoHlsRef.current = null;
+        }
+        if (audioRef.current) {
+          audioRef.current.pause();
+          audioRef.current.removeAttribute('src');
+        }
+        if (videoRef.current) {
+          videoRef.current.pause();
+          videoRef.current.removeAttribute('src');
+        }
+        return;
+      }
+
       // Start HTML5 Audio synchronously inside user gesture so mobile OS
       // keeps playback alive in background & screen-off.
       const audio = audioRef.current;
@@ -444,7 +499,7 @@ export default function App() {
         });
       }
     },
-    [attachMediaStream, currentTrack, isMuted, playbackRate, quality, showToast, volume]
+    [attachMediaStream, currentTrack, isMuted, isPlaying, playbackRate, quality, showToast, volume]
   );
 
   // If quality changes mid-playback for an audio track, swap stream cleanly keeping timestamp
@@ -463,7 +518,7 @@ export default function App() {
     }
   }, [quality, currentTrack]);
 
-  // Sync volume & mute to audio (and video when in standalone fallback)
+  // Sync volume & mute to audio, video, and YouTube embed player
   useEffect(() => {
     const effectiveVol = isMuted ? 0 : volume;
     if (audioRef.current) audioRef.current.volume = effectiveVol;
@@ -472,6 +527,10 @@ export default function App() {
       if (currentTrack?.kind === 'video' && !videoStandaloneRef.current) {
         videoRef.current.muted = true;
       }
+    }
+    if (ytControlRef.current) {
+      ytControlRef.current.setVolume(volume);
+      ytControlRef.current.setMute(isMuted);
     }
   }, [volume, isMuted, currentTrack?.kind, videoStandalone]);
 
@@ -505,6 +564,13 @@ export default function App() {
 
   const togglePlay = useCallback(() => {
     if (!currentTrack) return;
+    const streamUrl = selectStreamUrl(currentTrack, quality);
+    if (streamUrl.startsWith('yt://') && ytControlRef.current) {
+      if (isPlaying) ytControlRef.current.pause();
+      else ytControlRef.current.play();
+      return;
+    }
+
     if (currentTrack.kind === 'video' && !videoStandaloneRef.current) {
       const audio = audioRef.current;
       const vid = videoRef.current;
@@ -531,10 +597,15 @@ export default function App() {
     } else {
       el.pause();
     }
-  }, [currentTrack, getActiveMediaElement]);
+  }, [currentTrack, getActiveMediaElement, isPlaying, quality]);
 
   const handleSeek = useCallback(
     (time: number) => {
+      if (currentTrack && selectStreamUrl(currentTrack, quality).startsWith('yt://')) {
+        ytControlRef.current?.seekTo(time);
+        setCurrentTime(time);
+        return;
+      }
       const el = getActiveMediaElement();
       if (!el) return;
       el.currentTime = time;
@@ -547,19 +618,25 @@ export default function App() {
       }
       setCurrentTime(time);
     },
-    [currentTrack?.kind, getActiveMediaElement]
+    [currentTrack, getActiveMediaElement, quality]
   );
 
   const handlePlaybackRateChange = useCallback((rate: number) => {
     setPlaybackRate(rate);
     if (audioRef.current) audioRef.current.playbackRate = rate;
     if (videoRef.current) videoRef.current.playbackRate = rate;
+    if (ytControlRef.current) ytControlRef.current.setPlaybackRate(rate);
   }, []);
 
   const handleNext = useCallback(async () => {
     if (!currentTrack) return;
 
     if (repeat === 'one') {
+      if (selectStreamUrl(currentTrack, quality).startsWith('yt://')) {
+        ytControlRef.current?.seekTo(0);
+        ytControlRef.current?.play();
+        return;
+      }
       const el = getActiveMediaElement();
       if (el) {
         el.currentTime = 0;
@@ -573,6 +650,11 @@ export default function App() {
         videoRef.current.currentTime = 0;
         if (!document.hidden) videoRef.current.play().catch(() => {});
       }
+      return;
+    }
+
+    if (currentTrack.kind === 'video' && !videoAutoplayNext && repeat === 'off') {
+      setIsPlaying(false);
       return;
     }
 
@@ -589,6 +671,11 @@ export default function App() {
     }
 
     if (repeat === 'all') {
+      if (selectStreamUrl(currentTrack, quality).startsWith('yt://')) {
+        ytControlRef.current?.seekTo(0);
+        ytControlRef.current?.play();
+        return;
+      }
       const el = getActiveMediaElement();
       if (el) {
         el.currentTime = 0;
@@ -603,6 +690,25 @@ export default function App() {
         if (!document.hidden) videoRef.current.play().catch(() => {});
       }
       return;
+    }
+
+    if (currentTrack.kind === 'video' && videoAutoplayNext) {
+      try {
+        const seed =
+          currentTrack.artist && currentTrack.artist !== 'Music Channel'
+            ? `${currentTrack.artist.split(',')[0]} songs`
+            : currentTrack.title.replace(/#Video|#\S+|\(.*?\)|\[.*?\]/gi, ' ').trim();
+        const videos = await fetchVideosCatalogData(seed || 'hindi hits', 10);
+        const filtered = videos.filter((v) => v.id !== currentTrack.id);
+        if (filtered.length > 0) {
+          const [first, ...rest] = filtered;
+          setQueue(rest);
+          playTrack(first);
+          return;
+        }
+      } catch {
+        // fallback
+      }
     }
 
     if (autoplayRadio && currentTrack.kind === 'audio') {
@@ -620,7 +726,7 @@ export default function App() {
     }
 
     setIsPlaying(false);
-  }, [autoplayRadio, currentTrack, getActiveMediaElement, playTrack, queue, repeat, shuffle]);
+  }, [autoplayRadio, currentTrack, getActiveMediaElement, playTrack, quality, queue, repeat, shuffle, videoAutoplayNext]);
 
   const handlePrev = useCallback(() => {
     const el = getActiveMediaElement();
@@ -1057,23 +1163,33 @@ export default function App() {
       };
 
       try {
-        const data = await fetchSearchData(query, 10);
-        const bestMatch = pickBestAudioMatch(data.tracks || []);
-        if (bestMatch && data.tracks) {
+        const directAudio = await fetchMatchAudioData(cleanTitle, artist);
+        if (directAudio) {
           setNowPlayingOpen(false);
-          playTrack(bestMatch, data.tracks);
+          playTrack(directAudio);
+          return;
+        }
+        const data = await fetchSearchData(query, 10);
+        const audioOnly = (data.tracks || []).filter((t) => t.kind === 'audio');
+        const bestMatch = pickBestAudioMatch(audioOnly);
+        if (bestMatch) {
+          setNowPlayingOpen(false);
+          playTrack(bestMatch, audioOnly);
           return;
         }
         if (cleanTitle) {
           const fallbackData = await fetchSearchData(cleanTitle, 10);
-          const fallbackBest = pickBestAudioMatch(fallbackData.tracks || []);
-          if (fallbackBest && fallbackData.tracks) {
+          const fallbackAudioOnly = (fallbackData.tracks || []).filter(
+            (t) => t.kind === 'audio'
+          );
+          const fallbackBest = pickBestAudioMatch(fallbackAudioOnly);
+          if (fallbackBest) {
             setNowPlayingOpen(false);
-            playTrack(fallbackBest, fallbackData.tracks);
+            playTrack(fallbackBest, fallbackAudioOnly);
             return;
           }
         }
-        showToast('No matching audio found for this video.');
+        showToast('No audio-only track found — playing full song stream.');
       } catch {
         showToast('Could not switch to audio right now.');
       }
@@ -1887,6 +2003,19 @@ export default function App() {
 
               {searchResults && !searchLoading && (
                 <div className="space-y-9">
+                  {searchResults.correctedQuery && (
+                    <div className="px-4 py-2.5 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-xs text-zinc-300 flex flex-wrap items-center gap-1.5">
+                      <span>Showing smart match results including:</span>
+                      <button
+                        type="button"
+                        onClick={() => runSearch(searchResults.correctedQuery!)}
+                        className="font-semibold text-emerald-400 hover:text-emerald-300 underline underline-offset-2"
+                      >
+                        {searchResults.correctedQuery}
+                      </button>
+                    </div>
+                  )}
+
                   {/* Direct Matching Songs */}
                   {(searchTab === 'all' || searchTab === 'songs') && (
                     <div>
@@ -2199,27 +2328,40 @@ export default function App() {
                   </button>
                 </form>
 
-                <div className="flex items-center gap-1 p-1 rounded-lg bg-[#14171C] border border-white/[0.06]">
-                  {(
-                    [
-                      { id: 'relevance', label: 'Default' },
-                      { id: 'oldest', label: 'Oldest First' },
-                      { id: 'newest', label: 'Newest First' },
-                    ] as Array<{ id: SortOrder; label: string }>
-                  ).map((opt) => (
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="flex items-center gap-1 p-1 rounded-lg bg-[#14171C] border border-white/[0.06]">
+                    {(
+                      [
+                        { id: 'relevance', label: 'Default' },
+                        { id: 'oldest', label: 'Oldest First' },
+                        { id: 'newest', label: 'Newest First' },
+                      ] as Array<{ id: SortOrder; label: string }>
+                    ).map((opt) => (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        onClick={() => setSortOrder(opt.id)}
+                        className={`px-2.5 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                          sortOrder === opt.id
+                            ? 'bg-emerald-500 text-zinc-950 font-semibold'
+                            : 'text-zinc-400 hover:text-zinc-100'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  {filteredVideoCatalog.length > 0 && (
                     <button
-                      key={opt.id}
                       type="button"
-                      onClick={() => setSortOrder(opt.id)}
-                      className={`px-2.5 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
-                        sortOrder === opt.id
-                          ? 'bg-emerald-500 text-zinc-950 font-semibold'
-                          : 'text-zinc-400 hover:text-zinc-100'
-                      }`}
+                      onClick={() => playCollectionNonstop(filteredVideoCatalog)}
+                      className="h-9 px-3.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-semibold text-xs inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
                     >
-                      {opt.label}
+                      <Play size={13} className="fill-zinc-950" />
+                      <span>Play Video Playlist</span>
                     </button>
-                  ))}
+                  )}
                 </div>
               </div>
 
@@ -2721,6 +2863,20 @@ export default function App() {
         videoMuted={!videoStandalone}
         playbackRate={playbackRate}
         onPlaybackRateChange={handlePlaybackRateChange}
+        ytControlRef={ytControlRef}
+        onYtTimeUpdate={(cur, dur) => {
+          setCurrentTime(cur);
+          if (dur > 0) setDuration(dur);
+        }}
+        playlist={queue}
+        autoplayNext={videoAutoplayNext}
+        onToggleAutoplay={() => setVideoAutoplayNext((a) => !a)}
+        onSelectPlaylistTrack={(item) => {
+          const remaining = queue.filter((q) => q.id !== item.id);
+          setQueue(remaining);
+          playTrack(item);
+        }}
+        onRemovePlaylistTrack={(idx) => removeFromQueue(idx)}
         onVideoTimeUpdate={() => {
           if (videoStandaloneRef.current && videoRef.current) {
             setCurrentTime(videoRef.current.currentTime);

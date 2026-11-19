@@ -10,7 +10,13 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const PORT = Number(process.env.PORT) || 3000;
+const portFlagIndex = process.argv.indexOf('--port');
+const cliPort =
+  portFlagIndex !== -1 ? Number(process.argv[portFlagIndex + 1]) : NaN;
+const PORT =
+  Number.isFinite(cliPort) && cliPort > 0
+    ? cliPort
+    : Number(process.env.PORT) || 3000;
 const IS_PROD = process.env.NODE_ENV === 'production';
 
 interface RawSaavnImage {
@@ -358,7 +364,7 @@ async function fetchVideosFromItunes(
   return collected.slice(0, limit);
 }
 
-const DM_NOISE_RE = /\b(status|whatsapp|shorts?|reaction|interview|teaser|trailer|making of|behind the scenes|jukebox|mashup|non[\s-]?stop|all songs)\b/i;
+const DM_NOISE_RE = /\b(status|whatsapp|shorts?|reaction|interview|teaser|trailer|making of|behind the scenes|jukebox|mashup|non[\s-]?stop|all songs|news|debate|speech|podcast|viral video|press conference|mike)\b/i;
 
 function normalizeDailymotionVideo(raw: RawDailymotionVideo): NormalizedTrack | null {
   if (!raw.id || !raw.title) return null;
@@ -408,6 +414,430 @@ function normalizeDailymotionVideo(raw: RawDailymotionVideo): NormalizedTrack | 
       },
     ],
   };
+}
+
+function parseDurationLabel(label: string): number {
+  const parts = label
+    .trim()
+    .split(':')
+    .map((p) => Number(p))
+    .filter((n) => Number.isFinite(n));
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  return 0;
+}
+
+const PHONETIC_REPLACEMENTS: Array<[RegExp, string]> = [
+  [/\baasaman\b/gi, 'aasman'],
+  [/\baasmaan\b/gi, 'aasman'],
+  [/\btode\b/gi, 'tod'],
+  [/\bhoyi\b/gi, 'hoi'],
+  [/\bjeee+\b/gi, 'ji'],
+  [/\bjee\b/gi, 'ji'],
+  [/\bbhojpri\b/gi, 'bhojpuri'],
+  [/\bbhojpury\b/gi, 'bhojpuri'],
+  [/\bkhesri\b/gi, 'khesari'],
+  [/\bpwan\b/gi, 'pawan'],
+  [/\bsinhg\b/gi, 'singh'],
+  [/\bydav\b/gi, 'yadav'],
+  [/\barijt\b/gi, 'arijit'],
+  [/\bkesriya\b/gi, 'kesariya'],
+  [/\bashqi\b/gi, 'aashiqui'],
+  [/\bvodeo\b/gi, 'video'],
+  [/\bserch\b/gi, 'search'],
+];
+
+function normalizePhoneticQuery(raw: string): string {
+  let out = raw
+    .trim()
+    .replace(/([a-zA-Z])\1{2,}/g, '$1$1')
+    .replace(/\s+/g, ' ');
+  for (const [pattern, replacement] of PHONETIC_REPLACEMENTS) {
+    out = out.replace(pattern, replacement);
+  }
+  return out.trim();
+}
+
+function editDistance(a: string, b: string): number {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  const dp: number[] = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    let prev = dp[0];
+    dp[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const tmp = dp[j];
+      dp[j] =
+        a[i - 1] === b[j - 1]
+          ? prev
+          : 1 + Math.min(prev, dp[j], dp[j - 1]);
+      prev = tmp;
+    }
+  }
+  return dp[b.length];
+}
+
+const DEVANAGARI_CONSONANTS: Record<string, string> = {
+  '\u0915': 'k', '\u0916': 'kh', '\u0917': 'g', '\u0918': 'gh', '\u0919': 'ng',
+  '\u091a': 'ch', '\u091b': 'chh', '\u091c': 'j', '\u091d': 'jh', '\u091e': 'ny',
+  '\u091f': 't', '\u0920': 'th', '\u0921': 'd', '\u0922': 'dh', '\u0923': 'n',
+  '\u0924': 't', '\u0925': 'th', '\u0926': 'd', '\u0927': 'dh', '\u0928': 'n',
+  '\u092a': 'p', '\u092b': 'ph', '\u092c': 'b', '\u092d': 'bh', '\u092e': 'm',
+  '\u092f': 'y', '\u0930': 'r', '\u0932': 'l', '\u0935': 'w',
+  '\u0936': 'sh', '\u0937': 'sh', '\u0938': 's', '\u0939': 'h',
+  '\u0958': 'k', '\u0959': 'kh', '\u095a': 'g', '\u095b': 'z', '\u095c': 'd',
+  '\u095d': 'dh', '\u095e': 'f', '\u095f': 'y',
+};
+
+const DEVANAGARI_VOWELS: Record<string, string> = {
+  '\u0905': 'a', '\u0906': 'aa', '\u0907': 'i', '\u0908': 'ee', '\u0909': 'u', '\u090a': 'oo',
+  '\u090f': 'e', '\u0910': 'ai', '\u0913': 'o', '\u0914': 'au',
+};
+
+const DEVANAGARI_MATRAS: Record<string, string> = {
+  '\u093e': 'a', '\u093f': 'i', '\u0940': 'i', '\u0941': 'u', '\u0942': 'u',
+  '\u0947': 'e', '\u0948': 'ai', '\u094b': 'o', '\u094c': 'au',
+};
+
+function devanagariToLatin(input: string): string {
+  if (!/[\u0900-\u097F]/.test(input)) return input;
+  let out = '';
+  const chars = Array.from(input);
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
+    const next = chars[i + 1] || '';
+    if (DEVANAGARI_CONSONANTS[ch]) {
+      out += DEVANAGARI_CONSONANTS[ch];
+      if (next === '\u094d') {
+        i += 1; // halant suppresses inherent vowel
+      } else if (DEVANAGARI_MATRAS[next]) {
+        out += DEVANAGARI_MATRAS[next];
+        i += 1;
+      } else if (DEVANAGARI_CONSONANTS[next] || next === '\u0902' || next === '\u0901') {
+        out += 'a';
+      }
+      continue;
+    }
+    if (DEVANAGARI_VOWELS[ch]) {
+      out += DEVANAGARI_VOWELS[ch];
+      continue;
+    }
+    if (ch === '\u0902' || ch === '\u0901') {
+      out += 'n';
+      continue;
+    }
+    if (ch === '\u093c') continue; // nukta handled via precomposed or skipped
+    out += ch;
+  }
+  return out;
+}
+
+function scoreTrackQueryMatch(track: NormalizedTrack, query: string): number {
+  const norm = (s: string) =>
+    normalizePhoneticQuery(
+      devanagariToLatin(decodeEntities(s))
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    )
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+
+  const qNorm = norm(query);
+  if (!qNorm) return 0;
+  const rawTokens = qNorm.split(' ').filter((w) => w.length >= 2);
+  const FILLER_TOKENS = new Set(['ke', 'ka', 'ki', 'ko', 'me', 'se', 'pe', 'hai', 'ho']);
+  const nonFiller = rawTokens.filter((w) => !FILLER_TOKENS.has(w));
+  const qTokens = nonFiller.length > 0 ? nonFiller : rawTokens;
+  if (qTokens.length === 0) return 0;
+
+  const titleNorm = norm(track.title);
+  const artistNorm = norm(track.artist);
+  const albumNorm = norm(track.album);
+  const titleTokens = titleNorm.split(' ').filter((w) => w.length >= 2);
+  const artistTokens = artistNorm.split(' ').filter((w) => w.length >= 2);
+  const hay = `${titleNorm} ${artistNorm} ${albumNorm}`;
+  const hayTokens = hay.split(' ').filter((w) => w.length >= 2);
+
+  let score = 0;
+  if (titleNorm.includes(qNorm)) score += 120;
+  else if (artistNorm.includes(qNorm)) score += 105;
+  else if (hay.includes(qNorm)) score += 75;
+
+  let matched = 0;
+  for (const qt of qTokens) {
+    const inTitle = titleTokens.includes(qt) || (qt.length >= 5 && titleNorm.includes(qt));
+    if (inTitle) {
+      matched += 1;
+      score += 20;
+      continue;
+    }
+    const inArtist = artistTokens.includes(qt) || (qt.length >= 5 && artistNorm.includes(qt));
+    if (inArtist) {
+      matched += 1;
+      score += 18;
+      continue;
+    }
+    const inHay = hayTokens.includes(qt) || (qt.length >= 5 && hay.includes(qt));
+    if (inHay) {
+      matched += 1;
+      score += 14;
+      continue;
+    }
+    const maxDist = qt.length >= 6 ? 2 : 1;
+    if (
+      hayTokens.some(
+        (ht) =>
+          Math.abs(ht.length - qt.length) <= maxDist &&
+          editDistance(qt, ht) <= maxDist
+      )
+    ) {
+      matched += 0.85;
+      score += 11;
+    }
+  }
+
+  const coverage = matched / qTokens.length;
+  score += Math.round(coverage * 60);
+  if (qTokens.length >= 2 && coverage < 0.4) {
+    score -= 35;
+  }
+
+  const isSaavnAudio = track.kind === 'audio' && !track.id.startsWith('audius-');
+  if (
+    isSaavnAudio &&
+    qTokens[0].length >= 5 &&
+    (titleNorm === qTokens[0] || titleNorm.startsWith(`${qTokens[0]} `))
+  ) {
+    score += 42;
+  }
+
+  if (coverage >= 0.5) {
+    if (isSaavnAudio) {
+      score += 48;
+    } else if (track.id.startsWith('audius-')) {
+      score += 2;
+    }
+  }
+  return score;
+}
+
+async function fetchYouTubeSuggest(query: string): Promise<string[]> {
+  const clean = query.trim();
+  if (!clean) return [];
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 3500);
+  try {
+    const res = await fetch(
+      `https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&q=${encodeURIComponent(
+        clean
+      )}`,
+      {
+        signal: controller.signal,
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+      }
+    );
+    clearTimeout(timeout);
+    if (!res.ok) return [];
+    const data = (await res.json()) as [string, string[]];
+    return Array.isArray(data?.[1]) ? data[1].slice(0, 5) : [];
+  } catch {
+    clearTimeout(timeout);
+    return [];
+  }
+}
+
+async function fetchVideosFromYouTube(
+  query: string,
+  limit = 16
+): Promise<{ videos: NormalizedTrack[]; correctedQuery?: string }> {
+  const clean = query.trim();
+  if (!clean) return { videos: [] };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 6500);
+  try {
+    const res = await fetch(
+      `https://www.youtube.com/results?search_query=${encodeURIComponent(clean)}`,
+      {
+        signal: controller.signal,
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+          'Accept-Language': 'en-IN,en;q=0.9,hi;q=0.8',
+        },
+      }
+    );
+    clearTimeout(timeout);
+    if (!res.ok) return { videos: [] };
+    const html = await res.text();
+    const match = html.match(/var ytInitialData\s*=\s*(\{[\s\S]*?\});\s*<\/script>/);
+    if (!match) return { videos: [] };
+    const data = JSON.parse(match[1]) as {
+      contents?: {
+        twoColumnSearchResultsRenderer?: {
+          primaryContents?: {
+            sectionListRenderer?: {
+              contents?: Array<{
+                itemSectionRenderer?: {
+                  contents?: Array<{
+                    showingResultsForRenderer?: {
+                      correctedQuery?: { runs?: Array<{ text?: string }> };
+                    };
+                    didYouMeanRenderer?: {
+                      correctedQuery?: { runs?: Array<{ text?: string }> };
+                    };
+                    videoRenderer?: {
+                      videoId?: string;
+                      title?: { runs?: Array<{ text?: string }> };
+                      ownerText?: { runs?: Array<{ text?: string }> };
+                      lengthText?: { simpleText?: string };
+                      publishedTimeText?: { simpleText?: string };
+                      thumbnail?: { thumbnails?: Array<{ url?: string }> };
+                    };
+                  }>;
+                };
+              }>;
+            };
+          };
+        };
+      };
+    };
+
+    const sections =
+      data?.contents?.twoColumnSearchResultsRenderer?.primaryContents
+        ?.sectionListRenderer?.contents || [];
+    let correctedQuery: string | undefined;
+    const videos: NormalizedTrack[] = [];
+    const seen = new Set<string>();
+
+    for (const sec of sections) {
+      for (const item of sec?.itemSectionRenderer?.contents || []) {
+        if (!correctedQuery && item.showingResultsForRenderer?.correctedQuery?.runs) {
+          correctedQuery = item.showingResultsForRenderer.correctedQuery.runs
+            .map((r) => r.text || '')
+            .join('')
+            .trim();
+        }
+        if (!correctedQuery && item.didYouMeanRenderer?.correctedQuery?.runs) {
+          correctedQuery = item.didYouMeanRenderer.correctedQuery.runs
+            .map((r) => r.text || '')
+            .join('')
+            .trim();
+        }
+
+        const v = item.videoRenderer;
+        if (!v?.videoId || seen.has(v.videoId)) continue;
+        const rawTitle = (v.title?.runs || []).map((r) => r.text || '').join('').trim();
+        const durLabel = v.lengthText?.simpleText || '';
+        const duration = durLabel ? parseDurationLabel(durLabel) : 0;
+        // Strictly full-length videos (60s to 15m), never 30s clips or hour-long streams
+        if (!rawTitle || duration < 60 || duration > 900) continue;
+        if (DM_NOISE_RE.test(rawTitle)) continue;
+
+        seen.add(v.videoId);
+        const channel =
+          (v.ownerText?.runs || []).map((r) => r.text || '').join('').trim() ||
+          'Music Channel';
+        const thumbs = v.thumbnail?.thumbnails || [];
+        const thumbSmall = thumbs[0]?.url || `https://i.ytimg.com/vi/${v.videoId}/mqdefault.jpg`;
+        const thumbLarge =
+          thumbs[thumbs.length - 1]?.url ||
+          `https://i.ytimg.com/vi/${v.videoId}/hq720.jpg`;
+
+        videos.push({
+          id: `yt-${v.videoId}`,
+          kind: 'video',
+          title: decodeEntities(rawTitle),
+          artist: decodeEntities(channel),
+          album: 'YouTube Music & Video',
+          year: '',
+          releaseDate: v.publishedTimeText?.simpleText || 'Full Video',
+          duration,
+          language: 'Full Video',
+          artwork: {
+            small: thumbSmall,
+            medium: thumbLarge,
+            large: thumbLarge,
+          },
+          streams: [{ quality: 'YouTube HD', url: `yt://${v.videoId}` }],
+        });
+        if (videos.length >= limit) break;
+      }
+      if (videos.length >= limit) break;
+    }
+
+    return { videos, correctedQuery };
+  } catch {
+    clearTimeout(timeout);
+    return { videos: [] };
+  }
+}
+
+async function fetchSongsFromAudius(
+  query: string,
+  limit = 8
+): Promise<NormalizedTrack[]> {
+  const clean = query.trim();
+  if (!clean) return [];
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 4000);
+  try {
+    const res = await fetch(
+      `https://api.audius.co/v1/tracks/search?query=${encodeURIComponent(
+        clean
+      )}&app_name=Swara`,
+      { signal: controller.signal }
+    );
+    clearTimeout(timeout);
+    if (!res.ok) return [];
+    const json = (await res.json()) as {
+      data?: Array<{
+        id?: string;
+        title?: string;
+        duration?: number;
+        genre?: string;
+        release_date?: string;
+        user?: { name?: string };
+        artwork?: { '150x150'?: string; '480x480'?: string; '1000x1000'?: string };
+      }>;
+    };
+    const out: NormalizedTrack[] = [];
+    for (const item of json.data || []) {
+      if (!item.id || !item.title || !item.duration || item.duration < 45) continue;
+      const yearStr = item.release_date ? item.release_date.slice(0, 4) : '';
+      out.push({
+        id: `audius-${item.id}`,
+        kind: 'audio',
+        title: decodeEntities(item.title),
+        artist: decodeEntities(item.user?.name || 'Independent Artist'),
+        album: item.genre || 'Audius Single',
+        year: yearStr,
+        releaseDate: formatLaunchDate(item.release_date, yearStr),
+        duration: Math.round(item.duration),
+        language: item.genre || 'Music',
+        artwork: {
+          small: item.artwork?.['150x150'] || '',
+          medium: item.artwork?.['480x480'] || item.artwork?.['150x150'] || '',
+          large: item.artwork?.['1000x1000'] || item.artwork?.['480x480'] || '',
+        },
+        streams: [
+          {
+            quality: '320kbps',
+            url: `https://api.audius.co/v1/tracks/${encodeURIComponent(
+              item.id
+            )}/stream?app_name=Swara`,
+          },
+        ],
+      });
+      if (out.length >= limit) break;
+    }
+    return out;
+  } catch {
+    clearTimeout(timeout);
+    return [];
+  }
 }
 
 async function fetchFullVideosFromDailymotion(
@@ -614,50 +1044,142 @@ async function createServer() {
     }
 
     try {
+      const phoneticQuery = normalizePhoneticQuery(query);
       const [
-        audioTracks,
+        rawAudioTracks,
+        ytResult,
+        ytSuggests,
         dmVideoTracks,
+        audiusTracks,
         albumData,
         playlistData,
         artistData,
       ] = await Promise.all([
         fetchSongsFromUpstream(query, page, limit).catch(() => [] as NormalizedTrack[]),
-        fetchFullVideosFromDailymotion(`${query} video song`, 12).catch(
+        fetchVideosFromYouTube(query, 14).catch(() => ({
+          videos: [] as NormalizedTrack[],
+          correctedQuery: undefined,
+        })),
+        fetchYouTubeSuggest(query).catch(() => [] as string[]),
+        fetchFullVideosFromDailymotion(`${phoneticQuery} video song`, 10).catch(
           () => [] as NormalizedTrack[]
         ),
+        fetchSongsFromAudius(phoneticQuery, 6).catch(() => [] as NormalizedTrack[]),
         fetchSaavnJson<{ results?: RawSaavnAlbum[] }>(
-          `/search/albums?query=${encodeURIComponent(query)}&limit=12`
+          `/search/albums?query=${encodeURIComponent(phoneticQuery)}&limit=12`
         ).catch(() => null),
         fetchSaavnJson<{ results?: RawSaavnPlaylist[] }>(
-          `/search/playlists?query=${encodeURIComponent(query)}&limit=10`
+          `/search/playlists?query=${encodeURIComponent(phoneticQuery)}&limit=10`
         ).catch(() => null),
         fetchSaavnJson<{ results?: RawSaavnArtist[] }>(
-          `/search/artists?query=${encodeURIComponent(query)}&limit=8`
+          `/search/artists?query=${encodeURIComponent(phoneticQuery)}&limit=8`
         ).catch(() => null),
       ]);
 
-      const videoTracks =
-        dmVideoTracks.length > 0
-          ? dmVideoTracks
-          : await fetchVideosFromItunes(query, 8).catch(() => [] as NormalizedTrack[]);
+      // Typo-tolerant fallback: run Saavn using spell-corrected / phonetic suggestion too
+      const correctedCandidate =
+        ytResult.correctedQuery ||
+        (ytSuggests[0] &&
+        ytSuggests[0].toLowerCase() !== query.toLowerCase()
+          ? ytSuggests[0]
+          : phoneticQuery !== query
+            ? phoneticQuery
+            : '');
 
-      const albums = (albumData?.results || [])
+      let extraAudio: NormalizedTrack[] = [];
+      let extraAlbums: RawSaavnAlbum[] = [];
+      let extraArtists: RawSaavnArtist[] = [];
+      if (
+        correctedCandidate &&
+        correctedCandidate.toLowerCase() !== query.toLowerCase()
+      ) {
+        const [corrSongs, corrAlb, corrArt] = await Promise.all([
+          fetchSongsFromUpstream(correctedCandidate, 1, limit).catch(
+            () => [] as NormalizedTrack[]
+          ),
+          fetchSaavnJson<{ results?: RawSaavnAlbum[] }>(
+            `/search/albums?query=${encodeURIComponent(correctedCandidate)}&limit=8`
+          ).catch(() => null),
+          fetchSaavnJson<{ results?: RawSaavnArtist[] }>(
+            `/search/artists?query=${encodeURIComponent(correctedCandidate)}&limit=6`
+          ).catch(() => null),
+        ]);
+        extraAudio = corrSongs;
+        extraAlbums = corrAlb?.results || [];
+        extraArtists = corrArt?.results || [];
+      }
+
+      const combinedSaavn = dedupeTracks([...rawAudioTracks, ...extraAudio, ...audiusTracks]);
+      const effectiveQuery = correctedCandidate || phoneticQuery || query;
+      const scoredAudioEntries = combinedSaavn
+        .map((t) => ({ track: t, score: scoreTrackQueryMatch(t, effectiveQuery) }))
+        .sort((a, b) => b.score - a.score);
+      const scoredAudio = scoredAudioEntries.map((x) => x.track);
+
+      // Include YouTube tracks in Songs list — prioritize them when Saavn lacks an exact match
+      // (e.g., YT-only songs like "Dilwa Tode Ke - Chand Jee")
+      const topScore = scoredAudioEntries[0]?.score ?? 0;
+      const ytScoredEntries = ytResult.videos.map((v, idx) => {
+        const base = scoreTrackQueryMatch(v, effectiveQuery);
+        const rankBoost = base >= 50 && idx < 3 ? (3 - idx) * 14 : 0;
+        return { track: v, score: base + rankBoost };
+      });
+
+      const matchingYtEntries = ytScoredEntries
+        .filter((x) => x.score >= 75)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 6);
+
+      // Always allow strongly matching YT songs to compete by relevance score if Saavn doesn't have an exact title match
+      let finalTracks: NormalizedTrack[];
+      if (scoredAudio.length < 4 || topScore < 200) {
+        const merged = [...scoredAudioEntries, ...matchingYtEntries].sort(
+          (a, b) => b.score - a.score
+        );
+        finalTracks = dedupeTracks(merged.map((x) => x.track));
+      } else {
+        const highYt = matchingYtEntries
+          .filter((x) => x.score >= 140)
+          .slice(0, 4)
+          .map((x) => x.track);
+        finalTracks = dedupeTracks([...scoredAudio, ...highYt]);
+      }
+
+      // Strictly full-length music videos only (YouTube + Dailymotion, zero 30-second clips) ranked by relevance
+      const musicCue = /\b(song|video|official|music|4k|hd|lyric|bhojpuri|gaana|geet|t-series|saregama|zee music)\b/i;
+      const videoTracks = dedupeTracks([...ytResult.videos, ...dmVideoTracks])
+        .map((v, idx) => {
+          const base = scoreTrackQueryMatch(v, effectiveQuery);
+          const cueBonus = musicCue.test(v.title) || musicCue.test(v.artist) ? 16 : 0;
+          const ytOrderBonus = v.id.startsWith('yt-') && idx < 4 ? (4 - idx) * 6 : 0;
+          return { v, s: base + cueBonus + ytOrderBonus };
+        })
+        .sort((a, b) => b.s - a.s)
+        .map((x) => x.v);
+
+      const albums = [...(albumData?.results || []), ...extraAlbums]
         .map(normalizeAlbum)
-        .filter((a): a is NonNullable<typeof a> => a !== null);
+        .filter(
+          (a, idx, arr): a is NonNullable<typeof a> =>
+            a !== null && arr.findIndex((x) => x?.id === a.id) === idx
+        );
 
       const playlists = (playlistData?.results || [])
         .map(normalizePlaylist)
         .filter((p): p is NonNullable<typeof p> => p !== null);
 
-      const artists = (artistData?.results || [])
+      const artists = [...(artistData?.results || []), ...extraArtists]
         .map(normalizeArtist)
-        .filter((a): a is NonNullable<typeof a> => a !== null);
+        .filter(
+          (a, idx, arr): a is NonNullable<typeof a> =>
+            a !== null && arr.findIndex((x) => x?.id === a.id) === idx
+        );
 
       // Build "Milte Julte" (similar/related) songs
-      const seenIds = new Set(audioTracks.map((t) => t.id));
+      const seenIds = new Set(finalTracks.map((t) => t.id));
       let similar: NormalizedTrack[] = [];
 
-      const seedTrack = audioTracks[0];
+      const seedTrack = scoredAudio[0] || finalTracks[0];
       const seedTerms: string[] = [];
 
       if (seedTrack) {
@@ -668,17 +1190,18 @@ async function createServer() {
         if (
           seedTrack.album &&
           seedTrack.album !== 'Single' &&
+          seedTrack.album !== 'YouTube Music & Video' &&
           seedTrack.album !== seedTrack.title
         ) {
           seedTerms.push(seedTrack.album);
         }
       }
 
-      const words = query.split(/\s+/).filter((w) => w.length >= 3);
+      const words = effectiveQuery.split(/\s+/).filter((w) => w.length >= 3);
       if (words.length > 1) {
         seedTerms.push(words[0]);
-      } else if (audioTracks.length < 6 && words.length === 1) {
-        seedTerms.push(`${words[0]} hindi song`);
+      } else if (finalTracks.length < 6 && words.length === 1) {
+        seedTerms.push(`${words[0]} song`);
       }
 
       if (seedTerms.length > 0) {
@@ -694,8 +1217,13 @@ async function createServer() {
 
       res.json({
         query,
+        correctedQuery:
+          correctedCandidate &&
+          correctedCandidate.toLowerCase() !== query.toLowerCase()
+            ? correctedCandidate
+            : undefined,
         page,
-        tracks: audioTracks,
+        tracks: finalTracks,
         videos: videoTracks,
         similar,
         albums,
@@ -838,18 +1366,21 @@ async function createServer() {
   });
 
   app.get('/api/music/videos', async (req, res) => {
-    const query = String(req.query.query || 'bollywood full video song').trim();
+    const rawQuery = String(req.query.query || 'bollywood full video song').trim();
+    const query = normalizePhoneticQuery(rawQuery) || rawQuery;
     const limit = Math.min(30, Math.max(1, Number(req.query.limit) || 20));
     try {
-      let videos = await fetchFullVideosFromDailymotion(`${query} video song`, limit);
-      if (videos.length < 4) {
-        const direct = await fetchFullVideosFromDailymotion(query, limit);
-        videos = dedupeTracks([...videos, ...direct]).slice(0, limit);
-      }
-      if (videos.length === 0) {
-        videos = await fetchVideosFromItunes(query, limit);
-      }
-      res.json({ query, videos });
+      const [ytRes, dmVideos] = await Promise.all([
+        fetchVideosFromYouTube(`${query} official video song`, limit).catch(() => ({
+          videos: [] as NormalizedTrack[],
+        })),
+        fetchFullVideosFromDailymotion(`${query} video song`, Math.ceil(limit / 2)).catch(
+          () => [] as NormalizedTrack[]
+        ),
+      ]);
+      // Interleave YouTube & Dailymotion full-length videos (never 30s previews)
+      const videos = dedupeTracks([...ytRes.videos, ...dmVideos]).slice(0, limit);
+      res.json({ query: rawQuery, videos });
     } catch {
       res.status(502).json({ error: 'Could not load music videos.' });
     }
@@ -1187,7 +1718,7 @@ async function createServer() {
               (phraseMatch &&
                 candRatio >= 0.65 &&
                 (artistMatch || albumMatch) &&
-                cand.id.startsWith('dm-'));
+                (cand.id.startsWith('dm-') || cand.id.startsWith('yt-')));
             const artistConfirmed =
               reqArtistTokens.length === 0 || artistMatch || albumMatch;
             passesGate = allReqMatched && noConflictingWord && artistConfirmed;
@@ -1198,7 +1729,8 @@ async function createServer() {
           }
 
           let score = 0;
-          if (cand.id.startsWith('dm-')) score += 60; // Strongly prefer full-length videos
+          if (cand.id.startsWith('dm-')) score += 60; // Prefer HLS MP4 for background sync
+          else if (cand.id.startsWith('yt-')) score += 45; // Full-length YouTube HD video
           if (exactTitle) score += 120;
           else if (phraseMatch) score += 80;
           score += Math.round(reqRatio * 45 + candRatio * 25);
@@ -1220,16 +1752,28 @@ async function createServer() {
     };
 
     try {
-      const dmQueries = [
+      const queries = [
         `${reqTitleNorm} ${primaryArtist}`.trim(),
         `${reqTitleNorm} ${reqAlbumNorm}`.trim(),
+        reqTitleNorm,
       ].filter((q, idx, arr) => Boolean(q) && arr.indexOf(q) === idx);
 
-      const dmBatches = await Promise.all(
-        dmQueries.map((q) => fetchFullVideosFromDailymotion(q, 10).catch(() => []))
-      );
-      const dmMatched = scoreCandidates(dedupeTracks(dmBatches.flat()));
+      const [dmBatches, ytBatches] = await Promise.all([
+        Promise.all(
+          queries.slice(0, 2).map((q) => fetchFullVideosFromDailymotion(q, 10).catch(() => []))
+        ),
+        Promise.all(
+          queries
+            .slice(0, 2)
+            .map((q) =>
+              fetchVideosFromYouTube(`${q} official video`, 8)
+                .then((r) => r.videos)
+                .catch(() => [] as NormalizedTrack[])
+            )
+        ),
+      ]);
 
+      const dmMatched = scoreCandidates(dedupeTracks(dmBatches.flat()));
       if (dmMatched.length > 0) {
         return res.json({
           matched: true,
@@ -1238,21 +1782,60 @@ async function createServer() {
         });
       }
 
-      // Secondary fallback to iTunes catalog if Dailymotion had no strict match
-      const itunesBatches = await Promise.all(
-        [`${reqTitleNorm} ${primaryArtist}`.trim(), reqTitleNorm]
-          .filter((q, idx, arr) => Boolean(q) && arr.indexOf(q) === idx)
-          .map((q) => fetchVideosFromItunes(q, 10).catch(() => []))
-      );
-      const itunesMatched = scoreCandidates(dedupeTracks(itunesBatches.flat()));
+      const ytMatched = scoreCandidates(dedupeTracks(ytBatches.flat()));
+      if (ytMatched.length > 0) {
+        return res.json({
+          matched: true,
+          video: ytMatched[0],
+          candidates: ytMatched,
+        });
+      }
+
+      // If strict gate didn't hit a full YouTube video, check top YouTube full-video query with title + artist
+      const fallbackYt = ytBatches[0]?.[0] || null;
+      if (fallbackYt && scoreTrackQueryMatch(fallbackYt, `${reqTitleNorm} ${primaryArtist}`) >= 75) {
+        return res.json({
+          matched: true,
+          video: fallbackYt,
+          candidates: ytBatches[0].slice(0, 6),
+        });
+      }
 
       res.json({
-        matched: itunesMatched.length > 0,
-        video: itunesMatched[0] || null,
-        candidates: itunesMatched,
+        matched: false,
+        video: null,
+        candidates: [],
       });
     } catch {
       res.status(502).json({ error: 'Could not match music video.' });
+    }
+  });
+
+  app.get('/api/music/match-audio', async (req, res) => {
+    const rawTitle = String(req.query.title || '').trim();
+    const rawArtist = String(req.query.artist || '').trim();
+    if (!rawTitle) {
+      return res.json({ track: null });
+    }
+    const cleanTitle = decodeEntities(rawTitle)
+      .replace(/#video|#bhojpuri|#song|#trending|full\s*video|official\s*video|4k\s*video|hd\s*video/gi, ' ')
+      .replace(/#\S+/g, ' ')
+      .replace(/\|.*$/, ' ')
+      .replace(/[\u{1F300}-\u{1FAFF}]/gu, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const q = normalizePhoneticQuery(`${cleanTitle} ${rawArtist}`.trim()) || cleanTitle;
+    try {
+      const tracks = await fetchSongsFromUpstream(q, 1, 8);
+      if (tracks.length === 0) return res.json({ track: null });
+      const scored = tracks
+        .map((t) => ({ t, score: scoreTrackQueryMatch(t, cleanTitle) }))
+        .sort((a, b) => b.score - a.score);
+      res.json({
+        track: scored[0] && scored[0].score >= 55 ? scored[0].t : null,
+      });
+    } catch {
+      res.json({ track: null });
     }
   });
 
@@ -1267,13 +1850,19 @@ async function createServer() {
           Promise.all(
             DISCOVER_SEEDS.map(async (seed) => {
               try {
-                const tracks =
-                  seed.kind === 'video'
-                    ? await fetchFullVideosFromDailymotion(
-                        `${seed.query} full video song`,
-                        8
-                      )
-                    : await fetchSongsFromUpstream(seed.query, 1, 8);
+                if (seed.kind === 'video') {
+                  const dm = await fetchFullVideosFromDailymotion(
+                    `${seed.query} full video song`,
+                    8
+                  );
+                  if (dm.length >= 4) return { ...seed, tracks: dm };
+                  const yt = await fetchVideosFromYouTube(
+                    `${seed.query} official video song`,
+                    8
+                  ).catch(() => ({ videos: [] as NormalizedTrack[] }));
+                  return { ...seed, tracks: dedupeTracks([...dm, ...yt.videos]).slice(0, 8) };
+                }
+                const tracks = await fetchSongsFromUpstream(seed.query, 1, 8);
                 return { ...seed, tracks };
               } catch {
                 return { ...seed, tracks: [] };
@@ -1477,12 +2066,27 @@ async function createServer() {
   });
 
   if (!IS_PROD) {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
+    const vitePromise = (async () => {
+      const { createServer: createViteServer } = await import('vite');
+      return createViteServer({
+        server: {
+          middlewareMode: true,
+          hmr: process.env.DISABLE_HMR === 'true' ? false : undefined,
+          ws: process.env.DISABLE_HMR === 'true' ? false : undefined,
+        },
+        appType: 'spa',
+      });
+    })();
+
+    vitePromise.catch((err) => {
+      console.error('Vite middleware initialization failed:', err);
     });
-    app.use(vite.middlewares);
+
+    app.use((req, res, next) => {
+      vitePromise
+        .then((vite) => vite.middlewares(req, res, next))
+        .catch(next);
+    });
   } else {
     const distPath = path.resolve(__dirname, 'dist');
     app.use(express.static(distPath));

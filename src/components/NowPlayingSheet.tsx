@@ -1,7 +1,8 @@
-import { useRef, type RefObject } from 'react';
+import { useEffect, useRef, type MutableRefObject, type RefObject } from 'react';
 import {
   ChevronDown,
   Heart,
+  ListMusic,
   Loader2,
   Maximize2,
   Mic2,
@@ -17,10 +18,80 @@ import {
   Video,
   Volume2,
   VolumeX,
+  X,
 } from 'lucide-react';
 import type { AudioQuality, RepeatMode, Track } from '../types/music';
 import { formatDuration } from '../utils/format';
 import { ArtworkImage } from './ArtworkImage';
+
+export interface YouTubePlayerControls {
+  play: () => void;
+  pause: () => void;
+  seekTo: (seconds: number) => void;
+  setVolume: (vol0to1: number) => void;
+  setMute: (muted: boolean) => void;
+  setPlaybackRate: (rate: number) => void;
+}
+
+interface YTPlayerInstance {
+  loadVideoById?: (id: string) => void;
+  playVideo?: () => void;
+  pauseVideo?: () => void;
+  seekTo?: (seconds: number, allowSeekAhead: boolean) => void;
+  setVolume?: (volume: number) => void;
+  mute?: () => void;
+  unMute?: () => void;
+  setPlaybackRate?: (rate: number) => void;
+  getCurrentTime?: () => number;
+  getDuration?: () => number;
+  destroy?: () => void;
+}
+
+declare global {
+  interface Window {
+    YT?: {
+      Player: new (
+        el: HTMLElement | string,
+        opts: {
+          host?: string;
+          videoId: string;
+          width?: string | number;
+          height?: string | number;
+          playerVars?: Record<string, string | number>;
+          events?: {
+            onReady?: (e: { target: YTPlayerInstance }) => void;
+            onStateChange?: (e: { data: number; target: YTPlayerInstance }) => void;
+            onError?: () => void;
+          };
+        }
+      ) => YTPlayerInstance;
+    };
+    onYouTubeIframeAPIReady?: () => void;
+  }
+}
+
+let ytApiLoadPromise: Promise<void> | null = null;
+function ensureYouTubeIframeApi(): Promise<void> {
+  if (typeof window === 'undefined') return Promise.resolve();
+  if (window.YT?.Player) return Promise.resolve();
+  if (ytApiLoadPromise) return ytApiLoadPromise;
+
+  ytApiLoadPromise = new Promise<void>((resolve) => {
+    const prev = window.onYouTubeIframeAPIReady;
+    window.onYouTubeIframeAPIReady = () => {
+      prev?.();
+      resolve();
+    };
+    const existing = document.querySelector('script[src="https://www.youtube.com/iframe_api"]');
+    if (!existing) {
+      const script = document.createElement('script');
+      script.src = 'https://www.youtube.com/iframe_api';
+      script.async = true;
+      document.head.appendChild(script);
+    }
+  });
+  return ytApiLoadPromise;
+}
 
 interface NowPlayingSheetProps {
   open: boolean;
@@ -62,6 +133,13 @@ interface NowPlayingSheetProps {
   onVideoEnded: () => void;
   onVideoPlayState: (playing: boolean) => void;
   onVideoWaiting: (waiting: boolean) => void;
+  ytControlRef?: MutableRefObject<YouTubePlayerControls | null>;
+  onYtTimeUpdate?: (current: number, dur: number) => void;
+  playlist?: Track[];
+  autoplayNext?: boolean;
+  onToggleAutoplay?: () => void;
+  onSelectPlaylistTrack?: (track: Track) => void;
+  onRemovePlaylistTrack?: (index: number) => void;
 }
 
 const QUALITIES: AudioQuality[] = ['320kbps', '160kbps', '96kbps'];
@@ -106,12 +184,171 @@ export function NowPlayingSheet({
   onVideoEnded,
   onVideoPlayState,
   onVideoWaiting,
+  ytControlRef,
+  onYtTimeUpdate,
+  playlist = [],
+  autoplayNext = true,
+  onToggleAutoplay,
+  onSelectPlaylistTrack,
+  onRemovePlaylistTrack,
 }: NowPlayingSheetProps) {
   const cinemaStageRef = useRef<HTMLDivElement | null>(null);
+  const ytContainerRef = useRef<HTMLDivElement | null>(null);
+  const ytPlayerRef = useRef<YTPlayerInstance | null>(null);
+  const loadedYtIdRef = useRef<string>('');
+
+  const callbacksRef = useRef({
+    onVideoEnded,
+    onVideoPlayState,
+    onVideoWaiting,
+    onVideoLoadedMetadata,
+    onVideoCanPlay,
+    onYtTimeUpdate,
+    volume,
+    isMuted,
+    playbackRate,
+  });
+  callbacksRef.current = {
+    onVideoEnded,
+    onVideoPlayState,
+    onVideoWaiting,
+    onVideoLoadedMetadata,
+    onVideoCanPlay,
+    onYtTimeUpdate,
+    volume,
+    isMuted,
+    playbackRate,
+  };
+
+  const isVideo = track?.kind === 'video';
+  const isYoutube = Boolean(isVideo && videoUrl.startsWith('yt://'));
+  const ytId = isYoutube ? videoUrl.slice(5) : '';
+  const isDmEmbed = Boolean(isVideo && videoUrl.startsWith('dm-embed://'));
+  const dmEmbedId = isDmEmbed ? videoUrl.slice(11) : '';
+
+  // Mount & reuse YouTube IFrame Player API cleanly
+  useEffect(() => {
+    if (!isYoutube || !ytId) {
+      if (ytPlayerRef.current) {
+        try {
+          ytPlayerRef.current.destroy?.();
+        } catch {
+          // ignore
+        }
+        ytPlayerRef.current = null;
+        loadedYtIdRef.current = '';
+      }
+      if (ytControlRef) ytControlRef.current = null;
+      return;
+    }
+
+    let cancelled = false;
+
+    const bindControls = (player: YTPlayerInstance) => {
+      if (!ytControlRef) return;
+      ytControlRef.current = {
+        play: () => player.playVideo?.(),
+        pause: () => player.pauseVideo?.(),
+        seekTo: (s: number) => player.seekTo?.(s, true),
+        setVolume: (v: number) => player.setVolume?.(Math.round(v * 100)),
+        setMute: (m: boolean) => (m ? player.mute?.() : player.unMute?.()),
+        setPlaybackRate: (r: number) => player.setPlaybackRate?.(r),
+      };
+    };
+
+    if (ytPlayerRef.current && loadedYtIdRef.current !== ytId) {
+      loadedYtIdRef.current = ytId;
+      ytPlayerRef.current.loadVideoById?.(ytId);
+      bindControls(ytPlayerRef.current);
+      return;
+    }
+
+    if (ytPlayerRef.current && loadedYtIdRef.current === ytId) {
+      return;
+    }
+
+    ensureYouTubeIframeApi().then(() => {
+      if (cancelled || !ytContainerRef.current || !window.YT?.Player) return;
+      ytContainerRef.current.innerHTML = '';
+      const targetDiv = document.createElement('div');
+      targetDiv.style.width = '100%';
+      targetDiv.style.height = '100%';
+      ytContainerRef.current.appendChild(targetDiv);
+
+      loadedYtIdRef.current = ytId;
+      const player = new window.YT.Player(targetDiv, {
+        host: 'https://www.youtube-nocookie.com',
+        videoId: ytId,
+        width: '100%',
+        height: '100%',
+        playerVars: {
+          autoplay: 1,
+          controls: 1,
+          rel: 0,
+          modestbranding: 1,
+          playsinline: 1,
+          iv_load_policy: 3,
+          origin: window.location.origin,
+        },
+        events: {
+          onReady: (e) => {
+            const p = e.target;
+            p.setVolume?.(Math.round(callbacksRef.current.volume * 100));
+            if (callbacksRef.current.isMuted) p.mute?.();
+            else p.unMute?.();
+            p.setPlaybackRate?.(callbacksRef.current.playbackRate || 1);
+            p.playVideo?.();
+            callbacksRef.current.onVideoWaiting(false);
+            callbacksRef.current.onVideoLoadedMetadata();
+            callbacksRef.current.onVideoCanPlay?.();
+          },
+          onStateChange: (e) => {
+            // YT.PlayerState: 0=ENDED, 1=PLAYING, 2=PAUSED, 3=BUFFERING
+            if (e.data === 1) {
+              callbacksRef.current.onVideoWaiting(false);
+              callbacksRef.current.onVideoPlayState(true);
+              const d = e.target.getDuration?.() || 0;
+              const t = e.target.getCurrentTime?.() || 0;
+              if (d > 0) callbacksRef.current.onYtTimeUpdate?.(t, d);
+            } else if (e.data === 2) {
+              callbacksRef.current.onVideoWaiting(false);
+              callbacksRef.current.onVideoPlayState(false);
+            } else if (e.data === 3) {
+              callbacksRef.current.onVideoWaiting(true);
+            } else if (e.data === 0) {
+              callbacksRef.current.onVideoEnded();
+            }
+          },
+          onError: () => {
+            callbacksRef.current.onVideoWaiting(false);
+            callbacksRef.current.onVideoEnded();
+          },
+        },
+      });
+      ytPlayerRef.current = player;
+      bindControls(player);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isYoutube, ytId, ytControlRef]);
+
+  // Poll YouTube player progress every 500ms
+  useEffect(() => {
+    if (!isYoutube || !isPlaying) return;
+    const id = setInterval(() => {
+      const p = ytPlayerRef.current;
+      if (!p) return;
+      const cur = p.getCurrentTime?.() || 0;
+      const dur = p.getDuration?.() || 0;
+      callbacksRef.current.onYtTimeUpdate?.(cur, dur);
+    }, 500);
+    return () => clearInterval(id);
+  }, [isYoutube, isPlaying]);
 
   if (!track) return null;
 
-  const isVideo = track.kind === 'video';
   const showCinemaVisual = !isVideo && visualMode;
   const effectiveDuration = duration || track.duration || 0;
   const progressPercent =
@@ -123,7 +360,11 @@ export function NowPlayingSheet({
       : track.year || 'Unknown';
 
   const handleFullscreen = () => {
-    const el = isVideo ? videoRef.current : cinemaStageRef.current;
+    const el = isVideo
+      ? isYoutube
+        ? ytContainerRef.current
+        : videoRef.current
+      : cinemaStageRef.current;
     if (!el) return;
     if (document.fullscreenElement) {
       document.exitFullscreen().catch(() => {});
@@ -166,7 +407,11 @@ export function NowPlayingSheet({
       </div>
 
       {/* Top bar */}
-      <header className="relative z-10 flex items-center justify-between px-4 sm:px-8 py-4 max-w-4xl w-full mx-auto">
+      <header
+        className={`relative z-10 flex items-center justify-between px-4 sm:px-8 py-4 w-full mx-auto ${
+          isVideo ? 'max-w-6xl' : 'max-w-4xl'
+        }`}
+      >
         <button
           type="button"
           onClick={onClose}
@@ -178,7 +423,9 @@ export function NowPlayingSheet({
 
         <span className="text-xs font-medium text-zinc-400 tracking-wide">
           {isVideo
-            ? 'Video Stage · Screen-Off Background Ready'
+            ? isYoutube || isDmEmbed
+              ? 'Full Video Theater · Continuous Playlist'
+              : 'Video Stage · Screen-Off Background Ready'
             : showCinemaVisual
               ? 'Cinema Visual Stage · Background Ready'
               : 'Audio Stage · Ad-Free'}
@@ -199,363 +446,520 @@ export function NowPlayingSheet({
       </header>
 
       {/* Main focal media */}
-      <div className="relative z-10 flex-1 flex flex-col items-center justify-center px-5 pb-10 pt-2 max-w-2xl w-full mx-auto">
-        {isVideo ? (
-          <div className="w-full aspect-video rounded-2xl overflow-hidden bg-black border border-white/[0.1] shadow-2xl relative">
-            <video
-              ref={videoRef}
-              poster={track.artwork.large || track.artwork.medium || undefined}
-              muted={videoMuted}
-              playsInline
-              preload="auto"
-              onClick={onTogglePlay}
-              onTimeUpdate={onVideoTimeUpdate}
-              onLoadedMetadata={onVideoLoadedMetadata}
-              onCanPlay={onVideoCanPlay}
-              onEnded={onVideoEnded}
-              onPlay={() => onVideoPlayState(true)}
-              onPause={() => onVideoPlayState(false)}
-              onWaiting={() => onVideoWaiting(true)}
-              className="w-full h-full object-contain bg-black cursor-pointer"
-            />
-            <div className="absolute top-3 right-3 flex items-center gap-1.5">
-              {typeof document !== 'undefined' && document.pictureInPictureEnabled && (
-                <button
-                  type="button"
-                  onClick={handlePiP}
-                  className="min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg bg-black/65 text-zinc-200 hover:text-white hover:bg-black/80 transition-colors"
-                  aria-label="Picture in Picture"
-                  title="Picture in Picture"
-                >
-                  <PictureInPicture2 size={16} />
-                </button>
-              )}
-              <button
-                type="button"
-                onClick={handleFullscreen}
-                className="min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg bg-black/65 text-zinc-200 hover:text-white hover:bg-black/80 transition-colors"
-                aria-label="Fullscreen video"
-                title="Fullscreen"
-              >
-                <Maximize2 size={16} />
-              </button>
-            </div>
-          </div>
-        ) : showCinemaVisual ? (
-          <div className="w-full">
-            <div
-              ref={cinemaStageRef}
-              onClick={onTogglePlay}
-              className="w-full aspect-video rounded-2xl overflow-hidden bg-[#07080A] border border-white/[0.1] shadow-2xl relative cursor-pointer select-none"
-            >
-              {track.artwork.large && (
-                <img
-                  src={track.artwork.large}
-                  alt=""
-                  referrerPolicy="no-referrer"
-                  className={`absolute inset-0 w-full h-full object-cover transition-transform duration-700 ${
-                    isPlaying ? 'scale-110 opacity-40' : 'scale-105 opacity-25'
-                  } blur-2xl`}
+      <div
+        className={`relative z-10 flex-1 w-full mx-auto px-4 sm:px-8 pb-10 pt-2 ${
+          isVideo
+            ? 'max-w-6xl grid grid-cols-1 lg:grid-cols-[1fr_360px] gap-6 items-start'
+            : 'max-w-2xl flex flex-col items-center justify-center'
+        }`}
+      >
+        <div className="w-full flex flex-col items-center">
+          {isVideo ? (
+            <div className="w-full aspect-video rounded-2xl overflow-hidden bg-black border border-white/[0.1] shadow-2xl relative">
+              {isYoutube ? (
+                <div ref={ytContainerRef} className="w-full h-full bg-black" />
+              ) : isDmEmbed ? (
+                <iframe
+                  key={dmEmbedId}
+                  src={`https://www.dailymotion.com/embed/video/${encodeURIComponent(
+                    dmEmbedId
+                  )}?autoplay=1&queue-enable=false`}
+                  title={track.title}
+                  allow="autoplay; fullscreen; picture-in-picture"
+                  allowFullScreen
+                  className="w-full h-full border-0 bg-black"
                 />
-              )}
-              <div className="absolute inset-0 bg-gradient-to-t from-black/90 via-black/45 to-black/60" />
-
-              <div className="relative z-10 h-full flex flex-col items-center justify-center p-5 text-center">
-                <div
-                  className={`w-28 h-28 sm:w-36 sm:h-36 rounded-2xl overflow-hidden shadow-2xl border border-white/[0.14] transition-transform duration-500 ${
-                    isPlaying ? 'scale-100' : 'scale-95 opacity-90'
-                  }`}
-                >
-                  <ArtworkImage
-                    src={track.artwork.large || track.artwork.medium}
-                    alt={track.title}
-                    className="w-full h-full"
-                    iconSize={36}
+              ) : (
+                <>
+                  <video
+                    ref={videoRef}
+                    poster={track.artwork.large || track.artwork.medium || undefined}
+                    muted={videoMuted}
+                    playsInline
+                    preload="auto"
+                    onClick={onTogglePlay}
+                    onTimeUpdate={onVideoTimeUpdate}
+                    onLoadedMetadata={onVideoLoadedMetadata}
+                    onCanPlay={onVideoCanPlay}
+                    onEnded={onVideoEnded}
+                    onPlay={() => onVideoPlayState(true)}
+                    onPause={() => onVideoPlayState(false)}
+                    onWaiting={() => onVideoWaiting(true)}
+                    className="w-full h-full object-contain bg-black cursor-pointer"
                   />
-                </div>
-
-                {/* Equalizer bars synced to playback */}
-                <div
-                  className="mt-4 flex items-end justify-center gap-1.5 h-8"
-                  aria-hidden="true"
-                >
-                  {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map((bar) => (
-                    <span
-                      key={bar}
-                      className={`w-1.5 rounded-full bg-emerald-400/90 ${
-                        isPlaying ? 'swara-eq-bar h-full' : 'h-2 opacity-40'
-                      }`}
-                      style={
-                        isPlaying
-                          ? {
-                              animationDelay: `${(bar % 5) * 0.14}s`,
-                              animationDuration: `${0.75 + (bar % 4) * 0.18}s`,
-                            }
-                          : undefined
-                      }
-                    />
-                  ))}
-                </div>
-              </div>
-
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  handleFullscreen();
-                }}
-                className="absolute top-3 right-3 z-20 min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg bg-black/65 text-zinc-200 hover:text-white hover:bg-black/80 transition-colors"
-                aria-label="Fullscreen cinema stage"
-                title="Fullscreen"
-              >
-                <Maximize2 size={16} />
-              </button>
+                  <div className="absolute top-3 right-3 flex items-center gap-1.5">
+                    {typeof document !== 'undefined' &&
+                      document.pictureInPictureEnabled && (
+                        <button
+                          type="button"
+                          onClick={handlePiP}
+                          className="min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg bg-black/65 text-zinc-200 hover:text-white hover:bg-black/80 transition-colors"
+                          aria-label="Picture in Picture"
+                          title="Picture in Picture"
+                        >
+                          <PictureInPicture2 size={16} />
+                        </button>
+                      )}
+                    <button
+                      type="button"
+                      onClick={handleFullscreen}
+                      className="min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg bg-black/65 text-zinc-200 hover:text-white hover:bg-black/80 transition-colors"
+                      aria-label="Fullscreen video"
+                      title="Fullscreen"
+                    >
+                      <Maximize2 size={16} />
+                    </button>
+                  </div>
+                </>
+              )}
             </div>
-            <p className="text-center text-xs text-zinc-400 mt-2.5">
-              Official music video is not in catalog · Playing synced Cinema Visual for your exact song
-            </p>
-          </div>
-        ) : (
-          <div className="w-full max-w-[330px] aspect-square rounded-2xl overflow-hidden shadow-2xl border border-white/[0.08]">
-            <ArtworkImage
-              src={track.artwork.large || track.artwork.medium}
-              alt={`${track.title} album artwork`}
-              className="w-full h-full"
-              iconSize={48}
-            />
-          </div>
-        )}
-
-        <div className="w-full max-w-lg mt-6 text-center">
-          <h2 className="text-2xl font-display font-semibold text-white tracking-tight text-balance">
-            {track.title}
-          </h2>
-          <p className="text-sm text-zinc-300 mt-1.5 truncate">{track.artist}</p>
-          <p className="text-xs text-zinc-400 mt-1.5 truncate">
-            <span>Album: {track.album}</span>
-            <span className="mx-1.5 text-zinc-600" aria-hidden="true">
-              ·
-            </span>
-            <span className="font-mono tabular-nums">Launched {launchDisplay}</span>
-            {track.language && (
-              <>
-                <span className="mx-1.5 text-zinc-600" aria-hidden="true">
-                  ·
-                </span>
-                <span>{track.language}</span>
-              </>
-            )}
-          </p>
-          <div className="mt-3.5 flex flex-wrap items-center justify-center gap-2">
-            {onWatchVideo && track.kind === 'audio' && !showCinemaVisual && (
-              <button
-                type="button"
-                onClick={() => onWatchVideo(track)}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-emerald-400 hover:text-emerald-300 bg-emerald-500/10 hover:bg-emerald-500/15 border border-emerald-500/20 transition-colors"
+          ) : showCinemaVisual ? (
+            <div className="w-full">
+              <div
+                ref={cinemaStageRef}
+                onClick={onTogglePlay}
+                className="w-full aspect-video rounded-2xl overflow-hidden bg-[#07080A] border border-white/[0.1] shadow-2xl relative cursor-pointer select-none"
               >
-                <Video size={13} />
-                <span>Switch to Video</span>
-              </button>
-            )}
+                {track.artwork.large && (
+                  <img
+                    src={track.artwork.large}
+                    alt=""
+                    referrerPolicy="no-referrer"
+                    className={`absolute inset-0 w-full h-full object-cover transition-transform duration-700 ${
+                      isPlaying ? 'scale-110 opacity-40' : 'scale-105 opacity-25'
+                    } blur-2xl`}
+                  />
+                )}
+                <div className="absolute inset-0 bg-gradient-to-t from-black/90 via-black/45 to-black/60" />
 
-            {showCinemaVisual && onExitVisualMode && (
-              <button
-                type="button"
-                onClick={onExitVisualMode}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-emerald-400 hover:text-emerald-300 bg-emerald-500/10 hover:bg-emerald-500/15 border border-emerald-500/20 transition-colors"
-              >
-                <Music size={13} />
-                <span>Switch to Cover View</span>
-              </button>
-            )}
+                <div className="relative z-10 h-full flex flex-col items-center justify-center p-5 text-center">
+                  <div
+                    className={`w-28 h-28 sm:w-36 sm:h-36 rounded-2xl overflow-hidden shadow-2xl border border-white/[0.14] transition-transform duration-500 ${
+                      isPlaying ? 'scale-100' : 'scale-95 opacity-90'
+                    }`}
+                  >
+                    <ArtworkImage
+                      src={track.artwork.large || track.artwork.medium}
+                      alt={track.title}
+                      className="w-full h-full"
+                      iconSize={36}
+                    />
+                  </div>
 
-            {onSwitchToAudio && track.kind === 'video' && (
-              <button
-                type="button"
-                onClick={() => onSwitchToAudio(track)}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-emerald-400 hover:text-emerald-300 bg-emerald-500/10 hover:bg-emerald-500/15 border border-emerald-500/20 transition-colors"
-              >
-                <Music size={13} />
-                <span>Switch to Audio</span>
-              </button>
-            )}
+                  {/* Equalizer bars synced to playback */}
+                  <div
+                    className="mt-4 flex items-end justify-center gap-1.5 h-8"
+                    aria-hidden="true"
+                  >
+                    {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map((bar) => (
+                      <span
+                        key={bar}
+                        className={`w-1.5 rounded-full bg-emerald-400/90 ${
+                          isPlaying ? 'swara-eq-bar h-full' : 'h-2 opacity-40'
+                        }`}
+                        style={
+                          isPlaying
+                            ? {
+                                animationDelay: `${(bar % 5) * 0.14}s`,
+                                animationDuration: `${0.75 + (bar % 4) * 0.18}s`,
+                              }
+                            : undefined
+                        }
+                      />
+                    ))}
+                  </div>
+                </div>
 
-            {onOpenArtist && track.kind === 'audio' && (
-              <button
-                type="button"
-                onClick={() => {
-                  onClose();
-                  onOpenArtist(
-                    track.primaryArtistId || '',
-                    track.primaryArtistName || track.artist.split(',')[0].trim()
-                  );
-                }}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-zinc-200 hover:text-white bg-white/[0.06] hover:bg-white/[0.1] border border-white/[0.08] transition-colors"
-              >
-                <Mic2 size={13} />
-                <span>More songs by this artist</span>
-              </button>
-            )}
-          </div>
-        </div>
-
-        {/* Scrubber */}
-        <div className="w-full max-w-lg mt-6">
-          <input
-            type="range"
-            min={0}
-            max={effectiveDuration || 100}
-            step={0.5}
-            value={Math.min(currentTime, effectiveDuration || 100)}
-            onChange={(e) => onSeek(Number(e.target.value))}
-            aria-label="Seek position"
-            className="audio-range w-full h-5"
-            style={{
-              backgroundImage: `linear-gradient(to right, #34d399 ${progressPercent}%, rgba(255,255,255,0.16) ${progressPercent}%)`,
-              backgroundSize: '100% 4px',
-              backgroundRepeat: 'no-repeat',
-              backgroundPosition: 'center',
-            }}
-          />
-          <div className="flex items-center justify-between text-xs font-mono tabular-nums text-zinc-400 mt-1">
-            <span>{formatDuration(currentTime)}</span>
-            <span>{formatDuration(effectiveDuration)}</span>
-          </div>
-        </div>
-
-        {/* Transport buttons */}
-        <div className="w-full max-w-lg flex items-center justify-between mt-4 px-2">
-          <button
-            type="button"
-            onClick={onToggleShuffle}
-            className={`min-h-[44px] min-w-[44px] flex items-center justify-center rounded-xl transition-colors ${
-              shuffle ? 'text-emerald-400 bg-emerald-500/15' : 'text-zinc-400 hover:text-white'
-            }`}
-            aria-label="Toggle shuffle"
-            aria-pressed={shuffle}
-          >
-            <Shuffle size={20} />
-          </button>
-
-          <button
-            type="button"
-            onClick={onPrev}
-            className="min-h-[48px] min-w-[48px] flex items-center justify-center rounded-xl text-zinc-200 hover:text-white transition-colors"
-            aria-label="Previous track"
-          >
-            <SkipBack size={26} className="fill-current" />
-          </button>
-
-          <button
-            type="button"
-            onClick={onTogglePlay}
-            className="w-16 h-16 flex items-center justify-center rounded-full bg-emerald-500 hover:bg-emerald-400 text-zinc-950 transition-colors active:scale-95 shadow-lg"
-            aria-label={isPlaying ? 'Pause' : 'Play'}
-          >
-            {isBuffering ? (
-              <Loader2 size={26} className="animate-spin" />
-            ) : isPlaying ? (
-              <Pause size={26} className="fill-zinc-950" />
-            ) : (
-              <Play size={26} className="fill-zinc-950 ml-0.5" />
-            )}
-          </button>
-
-          <button
-            type="button"
-            onClick={onNext}
-            className="min-h-[48px] min-w-[48px] flex items-center justify-center rounded-xl text-zinc-200 hover:text-white transition-colors"
-            aria-label="Next track"
-          >
-            <SkipForward size={26} className="fill-current" />
-          </button>
-
-          <button
-            type="button"
-            onClick={onCycleRepeat}
-            className={`min-h-[44px] min-w-[44px] flex items-center justify-center rounded-xl transition-colors ${
-              repeat !== 'off'
-                ? 'text-emerald-400 bg-emerald-500/15'
-                : 'text-zinc-400 hover:text-white'
-            }`}
-            aria-label={`Repeat mode: ${repeat}`}
-          >
-            {repeat === 'one' ? <Repeat1 size={20} /> : <Repeat size={20} />}
-          </button>
-        </div>
-
-        {/* Quality & Volume row */}
-        <div className="w-full max-w-lg mt-7 pt-5 border-t border-white/[0.08] flex flex-wrap items-center justify-between gap-4">
-          {!isVideo ? (
-            <div className="flex items-center gap-1 p-1 rounded-lg bg-white/[0.05]">
-              {QUALITIES.map((q) => (
                 <button
-                  key={q}
                   type="button"
-                  onClick={() => onSelectQuality(q)}
-                  className={`px-2.5 py-1.5 text-xs font-mono tabular-nums rounded-md transition-colors whitespace-nowrap shrink-0 ${
-                    quality === q
-                      ? 'bg-emerald-500 text-zinc-950 font-medium'
-                      : 'text-zinc-400 hover:text-zinc-200'
-                  }`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleFullscreen();
+                  }}
+                  className="absolute top-3 right-3 z-20 min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg bg-black/65 text-zinc-200 hover:text-white hover:bg-black/80 transition-colors"
+                  aria-label="Fullscreen cinema stage"
+                  title="Fullscreen"
                 >
-                  {q.replace('kbps', 'k')}
+                  <Maximize2 size={16} />
                 </button>
-              ))}
+              </div>
+              <p className="text-center text-xs text-zinc-400 mt-2.5">
+                Official music video is not in catalog · Playing synced Cinema Visual for your exact song
+              </p>
             </div>
           ) : (
-            <div className="flex items-center gap-1 p-1 rounded-lg bg-white/[0.05]">
-              {[0.75, 1, 1.25, 1.5, 2].map((rate) => (
-                <button
-                  key={rate}
-                  type="button"
-                  onClick={() => {
-                    if (onPlaybackRateChange) {
-                      onPlaybackRateChange(rate);
-                    } else if (videoRef.current) {
-                      videoRef.current.playbackRate = rate;
-                    }
-                  }}
-                  className={`px-2 py-1 text-xs font-mono tabular-nums rounded-md transition-colors ${
-                    playbackRate === rate
-                      ? 'bg-emerald-500 text-zinc-950 font-medium'
-                      : 'text-zinc-400 hover:text-zinc-200'
-                  }`}
-                  title={`Playback speed ${rate}x`}
-                >
-                  {rate}x
-                </button>
-              ))}
+            <div className="w-full max-w-[330px] aspect-square rounded-2xl overflow-hidden shadow-2xl border border-white/[0.08]">
+              <ArtworkImage
+                src={track.artwork.large || track.artwork.medium}
+                alt={`${track.title} album artwork`}
+                className="w-full h-full"
+                iconSize={48}
+              />
             </div>
           )}
 
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={onToggleMute}
-              className="min-h-[40px] min-w-[40px] flex items-center justify-center rounded-lg text-zinc-400 hover:text-white"
-              aria-label={isMuted ? 'Unmute' : 'Mute'}
+          <div className={`w-full mt-5 ${isVideo ? 'text-left' : 'max-w-lg text-center'}`}>
+            <h2 className="text-xl sm:text-2xl font-display font-semibold text-white tracking-tight text-balance">
+              {track.title}
+            </h2>
+            <p className="text-sm text-zinc-300 mt-1 truncate">{track.artist}</p>
+            <p className="text-xs text-zinc-400 mt-1 truncate">
+              <span>Album: {track.album}</span>
+              <span className="mx-1.5 text-zinc-600" aria-hidden="true">
+                ·
+              </span>
+              <span className="font-mono tabular-nums">Launched {launchDisplay}</span>
+              {track.language && (
+                <>
+                  <span className="mx-1.5 text-zinc-600" aria-hidden="true">
+                    ·
+                  </span>
+                  <span>{track.language}</span>
+                </>
+              )}
+            </p>
+            <div
+              className={`mt-3.5 flex flex-wrap items-center gap-2 ${
+                isVideo ? 'justify-start' : 'justify-center'
+              }`}
             >
-              {isMuted || volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
-            </button>
+              {onWatchVideo && track.kind === 'audio' && !showCinemaVisual && (
+                <button
+                  type="button"
+                  onClick={() => onWatchVideo(track)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-emerald-400 hover:text-emerald-300 bg-emerald-500/10 hover:bg-emerald-500/15 border border-emerald-500/20 transition-colors"
+                >
+                  <Video size={13} />
+                  <span>Switch to Video</span>
+                </button>
+              )}
+
+              {showCinemaVisual && onExitVisualMode && (
+                <button
+                  type="button"
+                  onClick={onExitVisualMode}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-emerald-400 hover:text-emerald-300 bg-emerald-500/10 hover:bg-emerald-500/15 border border-emerald-500/20 transition-colors"
+                >
+                  <Music size={13} />
+                  <span>Switch to Cover View</span>
+                </button>
+              )}
+
+              {onSwitchToAudio && track.kind === 'video' && (
+                <button
+                  type="button"
+                  onClick={() => onSwitchToAudio(track)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-emerald-400 hover:text-emerald-300 bg-emerald-500/10 hover:bg-emerald-500/15 border border-emerald-500/20 transition-colors"
+                >
+                  <Music size={13} />
+                  <span>Switch to Audio</span>
+                </button>
+              )}
+
+              {onOpenArtist && track.kind === 'audio' && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    onClose();
+                    onOpenArtist(
+                      track.primaryArtistId || '',
+                      track.primaryArtistName || track.artist.split(',')[0].trim()
+                    );
+                  }}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-zinc-200 hover:text-white bg-white/[0.06] hover:bg-white/[0.1] border border-white/[0.08] transition-colors"
+                >
+                  <Mic2 size={13} />
+                  <span>More songs by this artist</span>
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Scrubber */}
+          <div className={`w-full mt-5 ${isVideo ? '' : 'max-w-lg'}`}>
             <input
               type="range"
               min={0}
-              max={1}
-              step={0.02}
-              value={isMuted ? 0 : volume}
-              onChange={(e) => onVolumeChange(Number(e.target.value))}
-              aria-label="Volume"
-              className="audio-range w-24 h-4"
+              max={effectiveDuration || 100}
+              step={0.5}
+              value={Math.min(currentTime, effectiveDuration || 100)}
+              onChange={(e) => onSeek(Number(e.target.value))}
+              aria-label="Seek position"
+              className="audio-range w-full h-5"
               style={{
-                backgroundImage: `linear-gradient(to right, #e4e4e7 ${(isMuted ? 0 : volume) * 100}%, rgba(255,255,255,0.16) ${(isMuted ? 0 : volume) * 100}%)`,
+                backgroundImage: `linear-gradient(to right, #34d399 ${progressPercent}%, rgba(255,255,255,0.16) ${progressPercent}%)`,
                 backgroundSize: '100% 4px',
                 backgroundRepeat: 'no-repeat',
                 backgroundPosition: 'center',
               }}
             />
+            <div className="flex items-center justify-between text-xs font-mono tabular-nums text-zinc-400 mt-1">
+              <span>{formatDuration(currentTime)}</span>
+              <span>{formatDuration(effectiveDuration)}</span>
+            </div>
+          </div>
+
+          {/* Transport buttons */}
+          <div
+            className={`w-full flex items-center justify-between mt-4 px-2 ${
+              isVideo ? '' : 'max-w-lg'
+            }`}
+          >
+            <button
+              type="button"
+              onClick={onToggleShuffle}
+              className={`min-h-[44px] min-w-[44px] flex items-center justify-center rounded-xl transition-colors ${
+                shuffle ? 'text-emerald-400 bg-emerald-500/15' : 'text-zinc-400 hover:text-white'
+              }`}
+              aria-label="Toggle shuffle"
+              aria-pressed={shuffle}
+            >
+              <Shuffle size={20} />
+            </button>
+
+            <button
+              type="button"
+              onClick={onPrev}
+              className="min-h-[48px] min-w-[48px] flex items-center justify-center rounded-xl text-zinc-200 hover:text-white transition-colors"
+              aria-label="Previous track"
+            >
+              <SkipBack size={26} className="fill-current" />
+            </button>
+
+            <button
+              type="button"
+              onClick={onTogglePlay}
+              className="w-14 h-14 sm:w-16 sm:h-16 flex items-center justify-center rounded-full bg-emerald-500 hover:bg-emerald-400 text-zinc-950 transition-colors active:scale-95 shadow-lg"
+              aria-label={isPlaying ? 'Pause' : 'Play'}
+            >
+              {isBuffering ? (
+                <Loader2 size={26} className="animate-spin" />
+              ) : isPlaying ? (
+                <Pause size={26} className="fill-zinc-950" />
+              ) : (
+                <Play size={26} className="fill-zinc-950 ml-0.5" />
+              )}
+            </button>
+
+            <button
+              type="button"
+              onClick={onNext}
+              className="min-h-[48px] min-w-[48px] flex items-center justify-center rounded-xl text-zinc-200 hover:text-white transition-colors"
+              aria-label="Next track"
+            >
+              <SkipForward size={26} className="fill-current" />
+            </button>
+
+            <button
+              type="button"
+              onClick={onCycleRepeat}
+              className={`min-h-[44px] min-w-[44px] flex items-center justify-center rounded-xl transition-colors ${
+                repeat !== 'off'
+                  ? 'text-emerald-400 bg-emerald-500/15'
+                  : 'text-zinc-400 hover:text-white'
+              }`}
+              aria-label={`Repeat mode: ${repeat}`}
+            >
+              {repeat === 'one' ? <Repeat1 size={20} /> : <Repeat size={20} />}
+            </button>
+          </div>
+
+          {/* Quality & Volume row */}
+          <div
+            className={`w-full mt-6 pt-5 border-t border-white/[0.08] flex flex-wrap items-center justify-between gap-4 ${
+              isVideo ? '' : 'max-w-lg'
+            }`}
+          >
+            {!isVideo ? (
+              <div className="flex items-center gap-1 p-1 rounded-lg bg-white/[0.05]">
+                {QUALITIES.map((q) => (
+                  <button
+                    key={q}
+                    type="button"
+                    onClick={() => onSelectQuality(q)}
+                    className={`px-2.5 py-1.5 text-xs font-mono tabular-nums rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                      quality === q
+                        ? 'bg-emerald-500 text-zinc-950 font-medium'
+                        : 'text-zinc-400 hover:text-zinc-200'
+                    }`}
+                  >
+                    {q.replace('kbps', 'k')}
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="flex items-center gap-1 p-1 rounded-lg bg-white/[0.05]">
+                {[0.75, 1, 1.25, 1.5, 2].map((rate) => (
+                  <button
+                    key={rate}
+                    type="button"
+                    onClick={() => {
+                      if (onPlaybackRateChange) {
+                        onPlaybackRateChange(rate);
+                      } else if (videoRef.current) {
+                        videoRef.current.playbackRate = rate;
+                      }
+                    }}
+                    className={`px-2 py-1 text-xs font-mono tabular-nums rounded-md transition-colors ${
+                      playbackRate === rate
+                        ? 'bg-emerald-500 text-zinc-950 font-medium'
+                        : 'text-zinc-400 hover:text-zinc-200'
+                    }`}
+                    title={`Playback speed ${rate}x`}
+                  >
+                    {rate}x
+                  </button>
+                ))}
+              </div>
+            )}
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={onToggleMute}
+                className="min-h-[40px] min-w-[40px] flex items-center justify-center rounded-lg text-zinc-400 hover:text-white"
+                aria-label={isMuted ? 'Unmute' : 'Mute'}
+              >
+                {isMuted || volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
+              </button>
+              <input
+                type="range"
+                min={0}
+                max={1}
+                step={0.02}
+                value={isMuted ? 0 : volume}
+                onChange={(e) => onVolumeChange(Number(e.target.value))}
+                aria-label="Volume"
+                className="audio-range w-24 h-4"
+                style={{
+                  backgroundImage: `linear-gradient(to right, #e4e4e7 ${(isMuted ? 0 : volume) * 100}%, rgba(255,255,255,0.16) ${(isMuted ? 0 : volume) * 100}%)`,
+                  backgroundSize: '100% 4px',
+                  backgroundRepeat: 'no-repeat',
+                  backgroundPosition: 'center',
+                }}
+              />
+            </div>
           </div>
         </div>
+
+        {/* Right Side: YouTube-Style Up Next Video Playlist Panel */}
+        {isVideo && (
+          <aside className="w-full rounded-2xl bg-[#121419]/95 border border-white/[0.08] overflow-hidden flex flex-col max-h-[600px]">
+            <div className="px-4 py-3.5 border-b border-white/[0.08] flex items-center justify-between gap-2 bg-[#161920]">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <ListMusic size={15} className="text-emerald-400 shrink-0" />
+                  <h3 className="font-display text-sm font-semibold text-white truncate">
+                    Up Next Video Playlist
+                  </h3>
+                </div>
+                <p className="text-[11px] text-zinc-400 mt-0.5">
+                  {playlist.length + 1} videos · Continuous ad-free playback
+                </p>
+              </div>
+
+              {onToggleAutoplay && (
+                <button
+                  type="button"
+                  onClick={onToggleAutoplay}
+                  className={`px-2.5 py-1 rounded-lg text-[11px] font-medium border transition-colors whitespace-nowrap shrink-0 ${
+                    autoplayNext
+                      ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                      : 'bg-white/[0.04] text-zinc-400 border-white/[0.08]'
+                  }`}
+                  title="Auto-play next video in playlist"
+                >
+                  Autoplay {autoplayNext ? 'ON' : 'OFF'}
+                </button>
+              )}
+            </div>
+
+            <div className="overflow-y-auto divide-y divide-white/[0.05]">
+              {/* Currently Playing item at top */}
+              <div className="p-3 bg-emerald-500/10 flex items-center gap-3">
+                <span className="w-5 text-center text-[11px] font-mono text-emerald-400 shrink-0">
+                  ▶
+                </span>
+                <div className="relative w-24 aspect-video rounded-lg overflow-hidden bg-black shrink-0">
+                  <ArtworkImage
+                    src={track.artwork.medium || track.artwork.small}
+                    alt={track.title}
+                    className="w-full h-full object-cover"
+                    iconSize={16}
+                  />
+                  {effectiveDuration > 0 && (
+                    <span className="absolute bottom-1 right-1 px-1 py-0.5 rounded bg-black/80 text-[10px] font-mono tabular-nums text-white">
+                      {formatDuration(effectiveDuration)}
+                    </span>
+                  )}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="text-xs font-medium text-emerald-300 line-clamp-2">
+                    {track.title}
+                  </p>
+                  <p className="text-[11px] text-zinc-400 truncate mt-0.5">
+                    {track.artist}
+                  </p>
+                </div>
+              </div>
+
+              {playlist.length === 0 ? (
+                <div className="p-6 text-center text-xs text-zinc-500">
+                  Loading related videos for playlist...
+                </div>
+              ) : (
+                playlist.map((item, idx) => (
+                  <div
+                    key={`${item.id}-${idx}`}
+                    className="group p-3 hover:bg-white/[0.04] transition-colors flex items-center gap-2.5"
+                  >
+                    <span className="w-5 text-center text-[11px] font-mono tabular-nums text-zinc-500 shrink-0">
+                      {idx + 1}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => onSelectPlaylistTrack?.(item)}
+                      className="flex-1 min-w-0 flex items-center gap-3 text-left focus-visible:outline-none"
+                    >
+                      <div className="relative w-24 aspect-video rounded-lg overflow-hidden bg-black shrink-0">
+                        <ArtworkImage
+                          src={item.artwork.medium || item.artwork.small}
+                          alt={item.title}
+                          className="w-full h-full object-cover"
+                          iconSize={16}
+                        />
+                        {item.duration > 0 && (
+                          <span className="absolute bottom-1 right-1 px-1 py-0.5 rounded bg-black/80 text-[10px] font-mono tabular-nums text-white">
+                            {formatDuration(item.duration)}
+                          </span>
+                        )}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="text-xs font-medium text-zinc-100 group-hover:text-emerald-300 line-clamp-2 transition-colors">
+                          {item.title}
+                        </p>
+                        <p className="text-[11px] text-zinc-400 truncate mt-0.5">
+                          {item.artist}
+                        </p>
+                      </div>
+                    </button>
+
+                    {onRemovePlaylistTrack && (
+                      <button
+                        type="button"
+                        onClick={() => onRemovePlaylistTrack(idx)}
+                        className="p-1.5 rounded-lg text-zinc-500 hover:text-rose-400 hover:bg-white/[0.06] opacity-70 group-hover:opacity-100 transition-opacity shrink-0"
+                        aria-label={`Remove ${item.title} from playlist`}
+                      >
+                        <X size={14} />
+                      </button>
+                    )}
+                  </div>
+                ))
+              )}
+            </div>
+          </aside>
+        )}
       </div>
     </div>
   );

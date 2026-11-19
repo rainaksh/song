@@ -280,6 +280,78 @@ async function directSaavn<T>(endpoint: string): Promise<T | null> {
   }
 }
 
+const PHONETIC_REPLACEMENTS: Array<[RegExp, string]> = [
+  [/\baasaman\b/gi, 'aasman'],
+  [/\baasmaan\b/gi, 'aasman'],
+  [/\btode\b/gi, 'tod'],
+  [/\bhoyi\b/gi, 'hoi'],
+  [/\bjeee+\b/gi, 'ji'],
+  [/\bjee\b/gi, 'ji'],
+  [/\bbhojpri\b/gi, 'bhojpuri'],
+  [/\bbhojpury\b/gi, 'bhojpuri'],
+  [/\bkhesri\b/gi, 'khesari'],
+  [/\bpwan\b/gi, 'pawan'],
+  [/\bsinhg\b/gi, 'singh'],
+  [/\bydav\b/gi, 'yadav'],
+  [/\barijt\b/gi, 'arijit'],
+  [/\bkesriya\b/gi, 'kesariya'],
+  [/\bashqi\b/gi, 'aashiqui'],
+  [/\bvodeo\b/gi, 'video'],
+  [/\bserch\b/gi, 'search'],
+];
+
+function normalizePhoneticQuery(raw: string): string {
+  let out = raw
+    .trim()
+    .replace(/([a-zA-Z])\1{2,}/g, '$1$1')
+    .replace(/\s+/g, ' ');
+  for (const [pattern, replacement] of PHONETIC_REPLACEMENTS) {
+    out = out.replace(pattern, replacement);
+  }
+  return out.trim();
+}
+
+function fetchJsonpSuggest(query: string): Promise<string[]> {
+  if (typeof document === 'undefined' || !query.trim()) {
+    return Promise.resolve([]);
+  }
+  return new Promise((resolve) => {
+    const cbName = `__swaraSuggest_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+    const script = document.createElement('script');
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve([]);
+    }, 2500);
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      delete (window as unknown as Record<string, unknown>)[cbName];
+      script.remove();
+    };
+
+    (window as unknown as Record<string, unknown>)[cbName] = (data: unknown) => {
+      cleanup();
+      if (Array.isArray(data) && Array.isArray(data[1])) {
+        const list = (data[1] as Array<string | [string]>)
+          .map((item) => (Array.isArray(item) ? String(item[0] || '') : String(item || '')))
+          .filter(Boolean);
+        resolve(list.slice(0, 5));
+      } else {
+        resolve([]);
+      }
+    };
+
+    script.src = `https://suggestqueries.google.com/complete/search?client=youtube&ds=yt&q=${encodeURIComponent(
+      query
+    )}&callback=${cbName}`;
+    script.onerror = () => {
+      cleanup();
+      resolve([]);
+    };
+    document.head.appendChild(script);
+  });
+}
+
 async function directSongs(query: string, limit = 24): Promise<Track[]> {
   const data = await directSaavn<{ results?: RawSaavnSong[] }>(
     `/search/songs?query=${encodeURIComponent(query)}&page=1&limit=${limit}`
@@ -289,16 +361,111 @@ async function directSongs(query: string, limit = 24): Promise<Track[]> {
     .filter((t): t is Track => t !== null);
 }
 
-async function directItunesVideos(query: string, limit = 12): Promise<Track[]> {
+const DM_NOISE_RE = /\b(status|whatsapp|shorts?|reaction|interview|teaser|trailer|making of|behind the scenes|jukebox|mashup|non[\s-]?stop|all songs)\b/i;
+
+async function directDailymotionVideos(query: string, limit = 12): Promise<Track[]> {
   try {
+    const fetchLimit = Math.min(30, Math.max(14, limit * 2));
     const res = await fetch(
-      `https://itunes.apple.com/search?term=${encodeURIComponent(query)}&country=IN&media=musicVideo&limit=${limit}`
+      `https://api.dailymotion.com/videos?search=${encodeURIComponent(
+        query
+      )}&fields=id,title,duration,owner.screenname,thumbnail_720_url,thumbnail_480_url,thumbnail_240_url,created_time&limit=${fetchLimit}`
     );
     if (!res.ok) return [];
-    const json = (await res.json()) as { results?: RawItunesVideo[] };
-    return (json.results || [])
-      .map(normalizeItunesVideo)
-      .filter((t): t is Track => t !== null);
+    const json = (await res.json()) as {
+      list?: Array<{
+        id?: string;
+        title?: string;
+        duration?: number;
+        'owner.screenname'?: string;
+        thumbnail_720_url?: string;
+        thumbnail_480_url?: string;
+        thumbnail_240_url?: string;
+        created_time?: number;
+      }>;
+    };
+    const out: Track[] = [];
+    for (const raw of json.list || []) {
+      const duration = Number(raw.duration) || 0;
+      if (!raw.id || !raw.title || duration < 60 || duration > 900) continue;
+      if (DM_NOISE_RE.test(raw.title)) continue;
+      const dateObj = raw.created_time ? new Date(raw.created_time * 1000) : null;
+      const yearStr =
+        dateObj && !Number.isNaN(dateObj.getTime()) ? String(dateObj.getFullYear()) : '';
+      out.push({
+        id: `dm-embed-${raw.id}`,
+        kind: 'video',
+        title: decodeHtmlEntities(raw.title),
+        artist: decodeHtmlEntities(raw['owner.screenname'] || 'Music Video'),
+        album: 'Full Video Song',
+        year: yearStr,
+        releaseDate: yearStr || 'Full Video',
+        duration,
+        language: 'Full Video',
+        artwork: {
+          small: raw.thumbnail_240_url || raw.thumbnail_480_url || '',
+          medium: raw.thumbnail_480_url || raw.thumbnail_720_url || '',
+          large: raw.thumbnail_720_url || raw.thumbnail_480_url || '',
+        },
+        streams: [{ quality: 'Full HD Video', url: `dm-embed://${raw.id}` }],
+      });
+      if (out.length >= limit) break;
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+async function directAudiusSongs(query: string, limit = 6): Promise<Track[]> {
+  try {
+    const res = await fetch(
+      `https://api.audius.co/v1/tracks/search?query=${encodeURIComponent(
+        query
+      )}&app_name=Swara`
+    );
+    if (!res.ok) return [];
+    const json = (await res.json()) as {
+      data?: Array<{
+        id?: string;
+        title?: string;
+        duration?: number;
+        genre?: string;
+        release_date?: string;
+        user?: { name?: string };
+        artwork?: { '150x150'?: string; '480x480'?: string };
+      }>;
+    };
+    const out: Track[] = [];
+    for (const item of json.data || []) {
+      if (!item.id || !item.title || !item.duration || item.duration < 45) continue;
+      out.push({
+        id: `audius-${item.id}`,
+        kind: 'audio',
+        title: decodeHtmlEntities(item.title),
+        artist: decodeHtmlEntities(item.user?.name || 'Independent Artist'),
+        album: item.genre || 'Audius Single',
+        year: item.release_date ? item.release_date.slice(0, 4) : '',
+        releaseDate: item.release_date ? item.release_date.slice(0, 4) : 'Unknown',
+        duration: Math.round(item.duration),
+        language: item.genre || 'Music',
+        artwork: {
+          small: item.artwork?.['150x150'] || '',
+          medium: item.artwork?.['480x480'] || item.artwork?.['150x150'] || '',
+          large: item.artwork?.['480x480'] || '',
+        },
+        streams: [
+          {
+            quality: '320kbps',
+            url: `https://api.audius.co/v1/tracks/${encodeURIComponent(
+              item.id
+            )}/stream?app_name=Swara`,
+          },
+        ],
+      });
+      if (out.length >= limit) break;
+    }
+    return out;
   } catch {
     return [];
   }
@@ -367,7 +534,7 @@ export async function fetchDiscoverData(): Promise<DiscoverPayload> {
         ...seed,
         tracks:
           seed.kind === 'video'
-            ? await directItunesVideos(seed.query, 8)
+            ? await directDailymotionVideos(`${seed.query} video song`, 8)
             : await directSongs(seed.query, 8),
       }))
     ),
@@ -439,20 +606,37 @@ export async function fetchSearchData(
     if (res.ok) return (await res.json()) as SearchResponse;
   }
 
-  const [tracks, videos, albumData, playlistData, artistData] = await Promise.all([
-    directSongs(query, limit),
-    directItunesVideos(query, 12),
-    directSaavn<{ results?: RawSaavnAlbum[] }>(
-      `/search/albums?query=${encodeURIComponent(query)}&limit=12`
-    ),
-    directSaavn<{ results?: RawSaavnPlaylist[] }>(
-      `/search/playlists?query=${encodeURIComponent(query)}&limit=10`
-    ),
-    directSaavn<{ results?: RawSaavnArtist[] }>(
-      `/search/artists?query=${encodeURIComponent(query)}&limit=8`
-    ),
-  ]);
+  const phoneticQuery = normalizePhoneticQuery(query);
+  const [rawTracks, suggestions, videos, audiusTracks, albumData, playlistData, artistData] =
+    await Promise.all([
+      directSongs(query, limit),
+      fetchJsonpSuggest(query),
+      directDailymotionVideos(`${phoneticQuery} video song`, 12),
+      directAudiusSongs(phoneticQuery, 6),
+      directSaavn<{ results?: RawSaavnAlbum[] }>(
+        `/search/albums?query=${encodeURIComponent(phoneticQuery)}&limit=12`
+      ),
+      directSaavn<{ results?: RawSaavnPlaylist[] }>(
+        `/search/playlists?query=${encodeURIComponent(phoneticQuery)}&limit=10`
+      ),
+      directSaavn<{ results?: RawSaavnArtist[] }>(
+        `/search/artists?query=${encodeURIComponent(phoneticQuery)}&limit=8`
+      ),
+    ]);
 
+  const corrected =
+    suggestions[0] && suggestions[0].toLowerCase() !== query.toLowerCase()
+      ? suggestions[0]
+      : phoneticQuery !== query
+        ? phoneticQuery
+        : '';
+
+  const extraTracks =
+    corrected && corrected.toLowerCase() !== query.toLowerCase()
+      ? await directSongs(corrected, limit)
+      : [];
+
+  const tracks = dedupeTracks([...rawTracks, ...extraTracks, ...audiusTracks]);
   const seenIds = new Set(tracks.map((t) => t.id));
   const seedTrack = tracks[0];
   const seedTerms: string[] = [];
@@ -471,6 +655,7 @@ export async function fetchSearchData(
 
   return {
     query,
+    correctedQuery: corrected || undefined,
     tracks,
     videos,
     similar: dedupeTracks(similarBatches.flat(), seenIds).slice(0, 16),
@@ -598,7 +783,8 @@ export async function fetchVideosCatalogData(
       return data.videos || [];
     }
   }
-  return directItunesVideos(query, limit);
+  const clean = normalizePhoneticQuery(query) || query;
+  return directDailymotionVideos(`${clean} video song`, limit);
 }
 
 export async function fetchMatchVideoData(
@@ -621,7 +807,6 @@ export async function fetchMatchVideoData(
     }
   }
 
-  // Direct strict iTunes fallback for static GitHub Pages
   const norm = (s: string) =>
     s
       .normalize('NFD')
@@ -634,17 +819,44 @@ export async function fetchMatchVideoData(
 
   const reqNorm = norm(title);
   const artistFirst = norm(artist.split(',')[0] || '');
-  const list = await directItunesVideos(`${reqNorm} ${artistFirst}`.trim(), 10);
+  const list = await directDailymotionVideos(`${reqNorm} ${artistFirst}`.trim(), 10);
   const matched = list.filter((v) => {
     const vNorm = norm(v.title);
-    const artistOk = !artistFirst || norm(v.artist).includes(artistFirst);
-    return vNorm === reqNorm && artistOk;
+    const artistOk = !artistFirst || norm(v.artist).includes(artistFirst) || vNorm.includes(artistFirst);
+    return vNorm.includes(reqNorm) && artistOk;
   });
   return {
     matched: matched.length > 0,
     video: matched[0] || null,
     candidates: matched,
   };
+}
+
+export async function fetchMatchAudioData(
+  title: string,
+  artist: string
+): Promise<Track | null> {
+  if (await isBackendAvailable()) {
+    const res = await fetch(
+      `/api/music/match-audio?title=${encodeURIComponent(title)}&artist=${encodeURIComponent(
+        artist
+      )}`
+    );
+    if (res.ok) {
+      const data = (await res.json()) as { track?: Track | null };
+      if (data.track) return data.track;
+    }
+  }
+  const cleanTitle = normalizePhoneticQuery(
+    title
+      .replace(/#video|#bhojpuri|#song|full\s*video|official\s*video/gi, ' ')
+      .replace(/#\S+/g, ' ')
+      .replace(/\|.*$/, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+  );
+  const songs = await directSongs(`${cleanTitle} ${artist}`.trim(), 5);
+  return songs[0] || null;
 }
 
 export async function fetchSuggestionsData(
